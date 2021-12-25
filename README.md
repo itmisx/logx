@@ -6,10 +6,10 @@ logger wraps uber/zap and trace with opentelemetry
 
 #### Feature
 
-- [x] 支持日志及切分
-- [x] 支持追踪（基于 `opentelemetry`）
-- [x] 支持 Debug,Info,Warn,Error,Fatal 日志等级
-- [x] 支持异常自动恢复 `defer logger.End(ctx)`
+- [X] 支持日志及切分
+- [X] 支持追踪（基于 `opentelemetry`）
+- [X] 支持 Debug,Info,Warn,Error,Fatal 日志等级
+- [X] 支持异常自动恢复 `defer logger.End(ctx)`
 
 #### Install
 
@@ -23,23 +23,36 @@ go get -u -v github.com/itmisx/logger
 
   ```go
   type Config struct {
-      Debug              bool    `yaml:"debug" mapstructure:"debug"`               // 调试模式，默认仅记录错误
-      EnableLog          bool    `yaml:"enable_log" mapstructure:"enable_log"`     // 日志文件记录开关
-      EnableTrace        bool    `yaml:"enable_trace" mapstructure:"enable_trace"` // 日志追踪开关
-      File               string  `yaml:"file" mapstructure:"file"`                 // 日志文件路径
-      MaxSize            int     `yaml:"max_size" mapstructure:"max_size"`         // 单个日志文件的大小限制，单位MB
-      MaxBackups         int     `yaml:"max_backups" mapstructure:"max_backups"`   // 日志文件数据的限制
-      MaxAge             int     `yaml:"max_age" mapstructure:"max_age"`           // 日志文件的保存天数
-      Compress           bool    `yaml:"compress" mapstructure:"compress"`         // 日志文件压缩开关
-      Rotate             string  `yaml:"rotate" mapstructure:"rotate"`             // 日志切分的时间，参考linux定时任务0 0 0  * * *，精确到秒
-      TracerProviderType string  `yaml:"tracer_provider_type" mapstructure:"tracer_provider_type"`// 追踪内容导出类型，默认为jaeger
-      TraceSampleRatio   float64 `yaml:"trace_sample_ratio" mapstructure:"trace_sample_ratio"` // 追踪采样的频率, 0.0-1
-      JaegerServer       string  `yaml:"jaeger_server" mapstructure:"jaeger_server"`// jaeger的URI地址
-      JaegerUsername     string  `yaml:"jaeger_username" mapstructure:"jaeger_username"`// jaeger用户名
-      JaegerPassword     string  `yaml:"jaeger_password" mapstructure:"jaeger_password"`// jaeger密码
+      // 调试模式，默认仅记录错误
+      Debug              bool    `yaml:"debug" mapstructure:"debug"`   
+      // 日志文件记录开关   
+      EnableLog          bool    `yaml:"enable_log" mapstructure:"enable_log"`   
+      // 日志追踪开关
+      EnableTrace        bool    `yaml:"enable_trace" mapstructure:"enable_trace"` 
+      // 日志文件路径
+      File               string  `yaml:"file" mapstructure:"file"` 
+      // 单个日志文件的大小限制，单位MB  
+      MaxSize            int     `yaml:"max_size" mapstructure:"max_size"`  
+      // 日志文件数据的限制   
+      MaxBackups         int     `yaml:"max_backups" mapstructure:"max_backups"` 
+      // 日志文件的保存天数  
+      MaxAge             int     `yaml:"max_age" mapstructure:"max_age"`   
+      // 日志文件压缩开关   
+      Compress           bool    `yaml:"compress" mapstructure:"compress"`
+      // 日志切分的时间，参考linux定时任务0 0 0  * * *，精确到秒  
+      Rotate             string  `yaml:"rotate" mapstructure:"rotate"`   
+      // 追踪内容导出类型，默认为jaeger
+      TracerProviderType string  `yaml:"tracer_provider_type" mapstructure:"tracer_provider_type"`
+      // 追踪采样的频率, 0.0-1
+      TraceSampleRatio   float64 `yaml:"trace_sample_ratio" mapstructure:"trace_sample_ratio"`
+      // jaeger的URI地址
+      JaegerServer       string  `yaml:"jaeger_server" mapstructure:"jaeger_server"`
+      // jaeger用户名
+      JaegerUsername     string  `yaml:"jaeger_username" mapstructure:"jaeger_username"`
+      // jaeger密码
+      JaegerPassword     string  `yaml:"jaeger_password" mapstructure:"jaeger_password"`
   }
   ```
-
 - 初始化
 
   ```go
@@ -69,10 +82,10 @@ go get -u -v github.com/itmisx/logger
       logger.Info(ctx,msg,logger.String("key","value"))
   }
   ```
-
 * 追踪传递，就是传递 traceID 和 spanID
 
   > gin 框架实例
+  >
 
   ```go
   // 请求方
@@ -102,6 +115,7 @@ go get -u -v github.com/itmisx/logger
   ```
 
   > 手动传递
+  >
 
   ```go
   // 对于不能通过函数或请求传递的，则需要手动传递

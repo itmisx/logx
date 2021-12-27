@@ -153,6 +153,20 @@ func Start(ctx context.Context, spanName string, spanStartOption ...Field) conte
 	return ctx
 }
 
+// SetSpanAttr set attributes for current span
+func SetSpanAttr(ctx context.Context, attributes ...Field) {
+	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
+	if !ok {
+		return
+	}
+	if !loggerSpanContext.startSpan {
+		return
+	}
+	if config.EnableTrace {
+		loggerSpanContext.span.SetAttributes(FieldsToKeyValues(attributes...)...)
+	}
+}
+
 // Debug record debug
 func Debug(ctx context.Context, msg string, attributes ...Field) {
 	logger.Debug(msg, FieldsToZapFields(ctx, attributes...)...)

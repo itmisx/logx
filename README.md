@@ -155,6 +155,10 @@ go get -u -v github.com/itmisx/logger
 - stringSlice
 - stringer, interface{String()string{}}
 
+#### 基于loki+tempo+grafana的效果（日志查询+追踪）
+![image](https://user-images.githubusercontent.com/5791324/147378026-42819fbb-5abf-46b9-8bba-a3ec7bfbcc81.png)
+
+
 #### License
 
 Use of logger is governed by the Mit License

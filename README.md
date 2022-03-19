@@ -4,6 +4,20 @@
 
 logger wraps uber/zap and trace with opentelemetry
 
+####
+```mermaid
+flowchart TB
+logger -- openTelemetrySDK --> trace
+trace -- http --> tempo
+
+logger -- zap --> log 
+log-->loki
+
+tempo-->grafana
+loki-->grafana
+
+```
+
 #### Feature
 
 - [X] 支持日志及切分

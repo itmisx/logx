@@ -6,7 +6,7 @@ logger wraps uber/zap and trace with opentelemetry
 
 ####
 ```mermaid
-flowchart TB
+flowchart LR
 logger -- openTelemetrySDK --> trace
 trace -- http --> tempo
 

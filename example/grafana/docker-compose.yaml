@@ -1,0 +1,75 @@
+version: "3"
+# logging模板
+x-logging: &tpl-logging
+  driver: loki
+  options:
+    loki-url: "http://localhost:31000/loki/api/v1/push"
+services:
+  # loki 日志搜集
+  loki:
+    image: grafana/loki:2.4.1
+    container_name: grafana_loki
+    depends_on:
+      - tempo
+    ports:
+      - "31000:3100"
+    volumes:
+      - ./loki/etc:/etc/loki
+        #environment:
+        #- JAEGER_AGENT_HOST=tempo
+        #- JAEGER_ENDPOINT=http://tempo:14268/api/traces # send traces to Tempo
+        #- JAEGER_SAMPLER_TYPE=const
+        #- JAEGER_SAMPLER_PARAM=1
+    networks:
+      - grafana
+    restart: "always"
+    logging:
+      driver: json-file
+      options:
+        max-size: "200k" # 单个文件大小为200k
+        max-file: "10" # 最多10个文件
+
+  # promtail 日志搜集
+  promtail:
+    image: grafana/promtail:2.4.1
+    container_name: grafana_promtail
+    networks:
+      - grafana
+    restart: "always"
+    logging: *tpl-logging
+
+  # tempo 日志追踪
+  tempo:
+    image: grafana/tempo:1.4.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    container_name: grafana_tempo
+    volumes:
+      - ./tempo/tempo-local.yaml:/etc/tempo.yaml
+      #- ./tempo/data:/tmp/tempo
+    ports:
+      - "14268:14268" # jaeger ingest
+      - "3200:3200" # tempo
+      - "55680" # otlp grpc
+      - "55681" # otlp http
+      - "9411" # zipkin
+    restart: "always"
+    networks:
+      - grafana
+    logging: *tpl-logging
+
+  # grafana 界面查看
+  grafana:
+    image: grafana/grafana:8.2.6
+    container_name: grafana
+    ports:
+      - "30000:3000"
+    volumes:
+      - ./grafana/data:/var/lib/grafana
+      - ./grafana/conf:/usr/share/grafana/conf
+    networks:
+      - grafana
+    restart: "always"
+    logging: *tpl-logging
+networks:
+  grafana:
+    external: true

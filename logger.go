@@ -2,11 +2,14 @@ package logger
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"strconv"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/contrib/propagators/b3"
@@ -18,60 +21,54 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-// Config
+// Config 配置项
 type Config struct {
-	// Print info or error,default false
+	// 是否开启debug模式，未开启debug模式，仅记录错误
 	Debug bool `yaml:"debug" mapstructure:"debug"`
-	// Enable to save log to the disk,default false
-	EnableLog bool `yaml:"enable_log" mapstructure:"enable_log"`
-	// Enable to generate trace info,default false
+	// 追踪使能
 	EnableTrace bool `yaml:"enable_trace" mapstructure:"enable_trace"`
-	// Path to store the log,default ./run.log
-	File string `yaml:"file" mapstructure:"file"`
-	// MaxSize is the maximum size in megabytes of the log file before it gets
-	// rotated. It defaults to 100 megabytes.
+	// 日志输出的方式
+	// none为不输出日志，file 为文件方式输出，console为控制台。默认为console
+	Output string `yaml:"output" mapstructure:"output"`
+	// 日志文件路径
+	File string `yaml:"file" mapstructure:"file"` // 日志文件路径
+	// 日志文件大小限制，默认最大100MB,超过将触发文件切割
 	MaxSize int `yaml:"max_size" mapstructure:"max_size"`
-	// MaxBackups is the maximum number of old log files to retain.  The default
-	// is to retain all old log files (though MaxAge may still cause them to get
-	// deleted.)
+	// 日志文件的分割文件的数量，超过的将会被删除
 	MaxBackups int `yaml:"max_backups" mapstructure:"max_backups"`
-	// MaxAge is the maximum number of days to retain old log files based on the
-	// timestamp encoded in their filename.  Note that a day is defined as 24
-	// hours and may not exactly correspond to calendar days due to daylight
-	// savings, leap seconds, etc. The default is not to remove old log files
-	// based on age.
+	// 日志文件的保留时间，超过的将会被删除
 	MaxAge int `yaml:"max_age" mapstructure:"max_age"`
-	// Compress determines if the rotated log files should be compressed
-	// using gzip. The default is not to perform compression.
+	// 是否启用日志文件的压缩功能
 	Compress bool `yaml:"compress" mapstructure:"compress"`
-	// "* * * * * *"，The smallest unit is seconds，refer to linux crond format
-	// Rotate causes Logger to close the existing log file and immediately create a new one.
-	// This is a helper function for applications that want to initiate rotations outside of the normal rotation rules,
-	// such as in response to SIGHUP. After rotating,
-	// this initiates a cleanup of old log files according to the normal rules.
+	// 是否启用日志的切割功能
 	Rotate string `yaml:"rotate" mapstructure:"rotate"`
-	// TraceProviderType support file or jaeger
+	// 日志追踪的类型，file or jaeger
 	TracerProviderType string `yaml:"tracer_provider_type" mapstructure:"tracer_provider_type"`
-	// trace sampling, 0.0-1
+	// 日志追踪采样的比率, 0.0-1
 	// 0,never trace
 	// 1,always trace
 	TraceSampleRatio float64 `yaml:"trace_sample_ratio" mapstructure:"trace_sample_ratio"`
-	// Jaeger URI
+	// 最大span数量限制，当达到最大限制时，停止trace
+	// default 200
+	MaxSpan int `yaml:"max_span" mapstructure:"max_span"`
+	// Jaeger server
 	JaegerServer   string `yaml:"jaeger_server" mapstructure:"jaeger_server"`
 	JaegerUsername string `yaml:"jaeger_username" mapstructure:"jaeger_username"`
 	JaegerPassword string `yaml:"jaeger_password" mapstructure:"jaeger_password"`
 }
 
 var (
-	logger   *zap.Logger
-	config   Config
-	provider *trace.TracerProvider
+	enable_log bool
+	logger     *zap.Logger
+	config     Config
+	provider   *trace.TracerProvider
 )
 
 // save context span
 type LoggerSpanContext struct {
 	span       oteltrace.Span
 	startSpan  bool
+	warnCount  int
 	errorCount int
 }
 
@@ -79,15 +76,46 @@ type loggerSpanContext int
 
 const loggerSpanContextKey loggerSpanContext = iota
 
-// init
-// auto init,this can useful to use zap/log directly
-func init() {
-	zapLogger := newZapLogger(Config{})
-	logger = zapLogger.Logger
+type spanCountT struct {
+	count sync.Map
 }
 
-// LoggerInit logger init
-// applicationAttributes
+// span数量控制
+var spanCount = spanCountT{
+	count: sync.Map{},
+}
+
+// 获取span计数
+func (s *spanCountT) get(traceID string, spanID string) int {
+	key := _md5(traceID + spanID)
+	c, ok := s.count.Load(key)
+	if ok {
+		count, _ := c.(int)
+		return count
+	}
+	return 0
+}
+
+// 设置span计数
+func (s *spanCountT) set(traceID string, spanID string, count int) {
+	key := _md5(traceID + spanID)
+	s.count.Store(key, count)
+}
+
+// span 计数自增
+func (s *spanCountT) increase(traceID string, spanID string) {
+	oldCount := s.get(traceID, spanID)
+	s.set(traceID, spanID, oldCount+1)
+}
+
+func (s *spanCountT) delete(traceID string, spanID string) {
+	key := _md5(traceID + spanID)
+	s.count.Delete(key)
+}
+
+// LoggerInit logger初始化
+//
+// applicationAttributes 应用属性，如应用的名称，版本等
 // can use service.name,service.namesapce,service.instance.id,service.version,
 // telemetry.sdk.name,telemetry.sdk.language,telemetry.sdk.version,telemetry.auto.version
 // or other key that you need
@@ -114,46 +142,54 @@ func Init(conf Config, applicationAttributes ...Field) {
 			provider = pd
 		}
 	}
-	zapLogger := newZapLogger(conf)
-	logger = zapLogger.Logger
-	// crond, rotate the log
-	zapLogger.rotateCrond(conf)
+	if config.Output != "none" {
+		enable_log = true
+		if config.Output == "" || (config.Output != "file" && config.Output != "console") {
+			config.Output = "console"
+		}
+		zapLogger := newZapLogger(conf)
+		logger = zapLogger.Logger
+		zapLogger.rotateCrond(conf)
+	}
+	if config.MaxSpan == 0 {
+		config.MaxSpan = 200
+	}
 }
 
-// Start start span
-//
-// example 1:
-// parentCtx:=Start(context.Background(),"span1",String("spanAttr","attr"))
-// Info(parentCtx,"msg",String("Attr","attr"))
-// End(parentCtx)
-// childCtx:=Start(parentCtx,"span2")
-// Info(childCtx,"msg")
-// End(childCtx)
-//
-// example 2:
-// ctx:= NewRootContext(traceID,spanID)
-// ctx1:=Start(ctx,"span1",String("spanAttr","attr"))
-// Info(ctx1,"msg")
-// End(ctx1)
+// Start 启动一个span追踪
+// ctx 上级span
+// spanName span名字
+// spanStartOption span附带属性
 func Start(ctx context.Context, spanName string, spanStartOption ...Field) context.Context {
 	var loggerSpanContext LoggerSpanContext
 	var spanContext context.Context
+	var enableTrace bool
 	var span oteltrace.Span
+	// 如果超过最大跟踪span限制，则停止追踪
+	if spanCount.get(TraceID(ctx), SpanID(ctx)) >= config.MaxSpan {
+		enableTrace = false
+	} else {
+		if config.EnableTrace {
+			enableTrace = true
+		}
+	}
 	loggerSpanContext.startSpan = true
 	spanName = spanName + " | " + time.Now().Format("15:04:05")
-	if config.EnableTrace {
+	// 根据条件
+	// 如果未开启追踪，则返回一个nooptreace，意味着将不再追踪
+	if enableTrace {
 		spanContext, span = provider.Tracer("").Start(ctx, spanName, oteltrace.WithAttributes(FieldsToKeyValues(spanStartOption...)...))
 		loggerSpanContext.span = span
+		spanCount.increase(TraceID(ctx), SpanID(ctx))
 	} else {
-		// if trace disabled,create a noopTrace
+		// 如果trace失能，将会创建一个noop traceProvider
 		spanContext, span = oteltrace.NewNoopTracerProvider().Tracer("").Start(ctx, spanName)
 		loggerSpanContext.span = span
 	}
-	ctx = context.WithValue(spanContext, loggerSpanContextKey, loggerSpanContext)
-	return ctx
+	return context.WithValue(spanContext, loggerSpanContextKey, loggerSpanContext)
 }
 
-// SetSpanAttr set attributes for current span
+// SetSpanAttr 为当前的span动态设置属性
 func SetSpanAttr(ctx context.Context, attributes ...Field) {
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
@@ -169,7 +205,9 @@ func SetSpanAttr(ctx context.Context, attributes ...Field) {
 
 // Debug record debug
 func Debug(ctx context.Context, msg string, attributes ...Field) {
-	logger.Debug(msg, FieldsToZapFields(ctx, attributes...)...)
+	if enable_log {
+		logger.Debug(msg, FieldsToZapFields(ctx, attributes...)...)
+	}
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
 		return
@@ -184,7 +222,9 @@ func Debug(ctx context.Context, msg string, attributes ...Field) {
 
 // Info record info
 func Info(ctx context.Context, msg string, attributes ...Field) {
-	logger.Info(msg, FieldsToZapFields(ctx, attributes...)...)
+	if enable_log {
+		logger.Info(msg, FieldsToZapFields(ctx, attributes...)...)
+	}
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
 		return
@@ -199,7 +239,9 @@ func Info(ctx context.Context, msg string, attributes ...Field) {
 
 // Warn record warn
 func Warn(ctx context.Context, msg string, attributes ...Field) {
-	logger.Warn(msg, FieldsToZapFields(ctx, attributes...)...)
+	if enable_log {
+		logger.Warn(msg, FieldsToZapFields(ctx, attributes...)...)
+	}
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
 		return
@@ -208,13 +250,18 @@ func Warn(ctx context.Context, msg string, attributes ...Field) {
 		return
 	}
 	if config.EnableTrace {
+		// add error tag and amount
+		loggerSpanContext.warnCount++
+		loggerSpanContext.span.SetAttributes(attribute.Int("warns", loggerSpanContext.warnCount))
 		loggerSpanContext.span.AddEvent(msg, oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
 	}
 }
 
 // Error record error
 func Error(ctx context.Context, msg string, attributes ...Field) {
-	logger.Error(msg, FieldsToZapFields(ctx, attributes...)...)
+	if enable_log {
+		logger.Error(msg, FieldsToZapFields(ctx, attributes...)...)
+	}
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
 		return
@@ -246,7 +293,9 @@ func Fatal(ctx context.Context, msg string, attributes ...Field) {
 			loggerSpanContext.span.RecordError(errors.New(msg), oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
 		}
 	}()
-	logger.Fatal(msg, FieldsToZapFields(ctx, attributes...)...)
+	if enable_log {
+		logger.Fatal(msg, FieldsToZapFields(ctx, attributes...)...)
+	}
 }
 
 // TraceID return traceID
@@ -324,10 +373,7 @@ func End(ctx context.Context) {
 	if config.EnableTrace {
 		loggerSpanContext.span.End()
 	}
-}
-
-func Flush(ctx context.Context) {
-	provider.Shutdown(ctx)
+	spanCount.delete(TraceID(ctx), SpanID(ctx))
 }
 
 // FieldsToZapFields
@@ -341,28 +387,30 @@ func FieldsToZapFields(ctx context.Context, fields ...Field) []zapcore.Field {
 	}
 	for _, f := range fields {
 		switch f.Type {
-		case BoolType:
+		case boolType:
 			kvs = append(kvs, zap.Bool(f.Key, f.Bool))
-		case BoolSliceType:
+		case boolSliceType:
 			kvs = append(kvs, zap.Bools(f.Key, f.Bools))
-		case IntType:
+		case intType:
 			kvs = append(kvs, zap.Int(f.Key, f.Integer))
-		case IntSliceType:
+		case intSliceType:
 			kvs = append(kvs, zap.Ints(f.Key, f.Integers))
-		case Int64Type:
+		case int64Type:
 			kvs = append(kvs, zap.Int64(f.Key, f.Integer64))
-		case Int64SliceType:
+		case int64SliceType:
 			kvs = append(kvs, zap.Int64s(f.Key, f.Integer64s))
-		case Float64Type:
+		case float64Type:
 			kvs = append(kvs, zap.Float64(f.Key, f.Float64))
-		case Float64SliceType:
+		case float64SliceType:
 			kvs = append(kvs, zap.Float64s(f.Key, f.Float64s))
-		case StringType:
+		case stringType:
 			kvs = append(kvs, zap.String(f.Key, f.String))
-		case StringSliceType:
+		case stringSliceType:
 			kvs = append(kvs, zap.Strings(f.Key, f.Strings))
-		case StringerType:
+		case stringerType:
 			kvs = append(kvs, zap.String(f.Key, f.String))
+		case anyType:
+			kvs = append(kvs, zap.Any(f.Key, f.Any))
 		}
 	}
 	return kvs
@@ -377,4 +425,11 @@ func randString(len int) string {
 		bytes = append(bytes, seed[r.Intn(15)])
 	}
 	return string(bytes)
+}
+
+// Md5 Md5
+func _md5(str string) string {
+	plain := md5.New()
+	plain.Write([]byte(str))
+	return hex.EncodeToString(plain.Sum(nil))
 }

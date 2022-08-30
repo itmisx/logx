@@ -20,8 +20,9 @@ import (
 func TestGetSpanNotInstrumented(t *testing.T) {
 	router := gin.New()
 	router.GET("/ping", func(c *gin.Context) {
+		ctx := c.Request.Context()
 		// Assert we don't have a span on the context.
-		span := oteltrace.SpanFromContext(c.Request.Context())
+		span := oteltrace.SpanFromContext(ctx)
 		ok := !span.SpanContext().IsValid()
 		assert.True(t, ok)
 		_, _ = c.Writer.Write([]byte("ok"))

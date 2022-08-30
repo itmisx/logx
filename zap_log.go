@@ -1,7 +1,6 @@
 package logger
 
 import (
-	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -26,6 +25,12 @@ func newZapLogger(conf Config) zapLogger {
 	if config.MaxAge == 0 {
 		config.MaxAge = 7
 	}
+	if conf.File == "" {
+		conf.File = "./logs/run.log"
+	}
+	if conf.MaxBackups == 0 {
+		conf.MaxBackups = 15
+	}
 	// log rolling config
 	hook := lumberjack.Logger{
 		Filename:   conf.File,
@@ -39,10 +44,11 @@ func newZapLogger(conf Config) zapLogger {
 	// lumberWriter and consoleWrite
 	var multiWriter zapcore.WriteSyncer
 	var writeSyncers []zapcore.WriteSyncer
-	if conf.EnableLog {
+	if conf.Output == "file" {
 		writeSyncers = append(writeSyncers, zapcore.AddSync(&hook))
+	} else {
+		writeSyncers = append(writeSyncers, zapcore.AddSync(os.Stdout))
 	}
-	writeSyncers = append(writeSyncers, zapcore.AddSync(os.Stdout))
 	if len(writeSyncers) > 0 {
 		multiWriter = zapcore.NewMultiWriteSyncer(writeSyncers...)
 	}
@@ -74,14 +80,6 @@ func newZapLogger(conf Config) zapLogger {
 		atomicLevel = zap.NewAtomicLevelAt(zap.ErrorLevel)
 	}
 
-	// debug mode,use console encoder
-	{
-		_, err := os.Stat("./__debug_bin")
-		if err == nil {
-			enco = zapcore.NewConsoleEncoder(encoderConfig)
-		}
-	}
-
 	// new core config
 	core := zapcore.NewCore(
 		enco,
@@ -103,7 +101,6 @@ func (zl zapLogger) rotateCrond(conf Config) {
 		rotateCrondOnce.Do(func() {
 			cron := cron.New(cron.WithSeconds())
 			cron.AddFunc(conf.Rotate, func() {
-				fmt.Println("rotate")
 				zl.lumLogger.Rotate()
 			})
 			cron.Start()

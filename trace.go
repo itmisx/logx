@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 
@@ -17,7 +18,8 @@ type Trace struct{}
 
 // NewJaegerProvider
 func (tx Trace) NewJaegerProvider(conf Config,
-	attributes ...Field) (*trace.TracerProvider, error) {
+	attributes ...Field,
+) (*trace.TracerProvider, error) {
 	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(conf.JaegerServer),
 		jaeger.WithUsername(conf.JaegerUsername),
 		jaeger.WithPassword(conf.JaegerPassword)))
@@ -79,29 +81,33 @@ func FieldsToKeyValues(fields ...Field) []attribute.KeyValue {
 	kvs := []attribute.KeyValue{}
 	for _, f := range fields {
 		switch f.Type {
-		case BoolType:
+		case boolType:
 			kvs = append(kvs, attribute.Bool(f.Key, f.Bool))
-		case BoolSliceType:
+		case boolSliceType:
 			kvs = append(kvs, attribute.BoolSlice(f.Key, f.Bools))
-		case IntType:
+		case intType:
 			kvs = append(kvs, attribute.Int(f.Key, f.Integer))
-		case IntSliceType:
+		case intSliceType:
 			kvs = append(kvs, attribute.IntSlice(f.Key, f.Integers))
-		case Int64Type:
+		case int64Type:
 			kvs = append(kvs, attribute.Int64(f.Key, f.Integer64))
-		case Int64SliceType:
+		case int64SliceType:
 			kvs = append(kvs, attribute.Int64Slice(f.Key, f.Integer64s))
-		case Float64Type:
+		case float64Type:
 			kvs = append(kvs, attribute.Float64(f.Key, f.Float64))
-		case Float64SliceType:
+		case float64SliceType:
 			kvs = append(kvs, attribute.Float64Slice(f.Key, f.Float64s))
-		case StringType:
+		case stringType:
 			kvs = append(kvs, attribute.String(f.Key, f.String))
-		case StringSliceType:
+		case stringSliceType:
 			kvs = append(kvs, attribute.StringSlice(f.Key, f.Strings))
-		case StringerType:
+		case stringerType:
 			stringer := stringer{str: f.String}
 			kvs = append(kvs, attribute.Stringer(f.Key, stringer))
+		case anyType:
+			if str, err := json.Marshal(f.Any); err == nil {
+				kvs = append(kvs, attribute.String(f.Key, string(str)))
+			}
 		}
 	}
 	return kvs

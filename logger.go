@@ -2,19 +2,15 @@ package logx
 
 import (
 	"context"
-	"crypto/md5"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"strconv"
-	"sync"
 	"time"
 
 	"go.opentelemetry.io/contrib/propagators/b3"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
@@ -66,52 +62,14 @@ var (
 
 // save context span
 type LoggerSpanContext struct {
-	span       oteltrace.Span
-	startSpan  bool
-	warnCount  int
-	errorCount int
+	span oteltrace.Span
 }
 
-type loggerSpanContext int
+type LoggerContextKey int
 
-const loggerSpanContextKey loggerSpanContext = iota
-
-type spanCountT struct {
-	count sync.Map
-}
-
-// span数量控制
-var spanCount = spanCountT{
-	count: sync.Map{},
-}
-
-// 获取span计数
-func (s *spanCountT) get(traceID string, spanID string) int {
-	key := _md5(traceID + spanID)
-	c, ok := s.count.Load(key)
-	if ok {
-		count, _ := c.(int)
-		return count
-	}
-	return 0
-}
-
-// 设置span计数
-func (s *spanCountT) set(traceID string, spanID string, count int) {
-	key := _md5(traceID + spanID)
-	s.count.Store(key, count)
-}
-
-// span 计数自增
-func (s *spanCountT) increase(traceID string, spanID string) {
-	oldCount := s.get(traceID, spanID)
-	s.set(traceID, spanID, oldCount+1)
-}
-
-func (s *spanCountT) delete(traceID string, spanID string) {
-	key := _md5(traceID + spanID)
-	s.count.Delete(key)
-}
+const (
+	loggerSpanContextKey LoggerContextKey = iota
+)
 
 // LoggerInit logger初始化
 //
@@ -165,37 +123,29 @@ func Start(ctx context.Context, spanName string, spanStartOption ...Field) conte
 	var spanContext context.Context
 	var enableTrace bool
 	var span oteltrace.Span
-	// 如果超过最大跟踪span限制，则停止追踪
-	if spanCount.get(TraceID(ctx), SpanID(ctx)) >= config.MaxSpan {
-		enableTrace = false
-	} else {
-		if config.EnableTrace {
-			enableTrace = true
-		}
+	// 根据配置开启日志追踪
+	if config.EnableTrace {
+		enableTrace = true
 	}
-	loggerSpanContext.startSpan = true
 	spanName = spanName + " | " + time.Now().Format("15:04:05")
 	// 根据条件
 	// 如果未开启追踪，则返回一个nooptreace，意味着将不再追踪
 	if enableTrace {
 		spanContext, span = provider.Tracer("").Start(ctx, spanName, oteltrace.WithAttributes(FieldsToKeyValues(spanStartOption...)...))
 		loggerSpanContext.span = span
-		spanCount.increase(TraceID(ctx), SpanID(ctx))
 	} else {
 		// 如果trace失能，将会创建一个noop traceProvider
 		spanContext, span = oteltrace.NewNoopTracerProvider().Tracer("").Start(ctx, spanName)
 		loggerSpanContext.span = span
 	}
-	return context.WithValue(spanContext, loggerSpanContextKey, loggerSpanContext)
+	startCtx := context.WithValue(spanContext, loggerSpanContextKey, loggerSpanContext)
+	return startCtx
 }
 
 // SetSpanAttr 为当前的span动态设置属性
 func SetSpanAttr(ctx context.Context, attributes ...Field) {
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
-		return
-	}
-	if !loggerSpanContext.startSpan {
 		return
 	}
 	if config.EnableTrace {
@@ -212,9 +162,6 @@ func Debug(ctx context.Context, msg string, attributes ...Field) {
 	if !ok {
 		return
 	}
-	if !loggerSpanContext.startSpan {
-		return
-	}
 	if config.EnableTrace {
 		loggerSpanContext.span.AddEvent(msg, oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
 	}
@@ -227,9 +174,6 @@ func Info(ctx context.Context, msg string, attributes ...Field) {
 	}
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
-		return
-	}
-	if !loggerSpanContext.startSpan {
 		return
 	}
 	if config.EnableTrace {
@@ -246,13 +190,7 @@ func Warn(ctx context.Context, msg string, attributes ...Field) {
 	if !ok {
 		return
 	}
-	if !loggerSpanContext.startSpan {
-		return
-	}
 	if config.EnableTrace {
-		// add error tag and amount
-		loggerSpanContext.warnCount++
-		loggerSpanContext.span.SetAttributes(attribute.Int("warns", loggerSpanContext.warnCount))
 		loggerSpanContext.span.AddEvent(msg, oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
 	}
 }
@@ -266,14 +204,7 @@ func Error(ctx context.Context, msg string, attributes ...Field) {
 	if !ok {
 		return
 	}
-	if !loggerSpanContext.startSpan {
-		return
-	}
 	if config.EnableTrace {
-		// add error tag and amount
-		loggerSpanContext.errorCount++
-		loggerSpanContext.span.SetAttributes(attribute.Int("errors", loggerSpanContext.errorCount))
-		// add error logs
 		loggerSpanContext.span.RecordError(errors.New(msg), oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
 	}
 }
@@ -283,9 +214,6 @@ func Fatal(ctx context.Context, msg string, attributes ...Field) {
 	defer func() {
 		loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 		if !ok {
-			return
-		}
-		if !loggerSpanContext.startSpan {
 			return
 		}
 		if config.EnableTrace {
@@ -369,11 +297,9 @@ func End(ctx context.Context) {
 	if !ok {
 		return
 	}
-	loggerSpanContext.startSpan = false
 	if config.EnableTrace {
 		loggerSpanContext.span.End()
 	}
-	spanCount.delete(TraceID(ctx), SpanID(ctx))
 }
 
 // FieldsToZapFields
@@ -425,11 +351,4 @@ func randString(len int) string {
 		bytes = append(bytes, seed[r.Intn(15)])
 	}
 	return string(bytes)
-}
-
-// Md5 Md5
-func _md5(str string) string {
-	plain := md5.New()
-	plain.Write([]byte(str))
-	return hex.EncodeToString(plain.Sum(nil))
 }

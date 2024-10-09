@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/itmisx/logger/propagation/extract"
+	"github.com/itmisx/logx/propagation/extract"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/gin-gonic/gin"

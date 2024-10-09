@@ -5,8 +5,8 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/itmisx/logger/propagation/extract"
-	"github.com/itmisx/logger/propagation/inject"
+	"github.com/itmisx/logx/propagation/extract"
+	"github.com/itmisx/logx/propagation/inject"
 )
 
 // HTTPInject inject spanContext

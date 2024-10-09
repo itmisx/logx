@@ -1,4 +1,4 @@
-package logger
+package logx
 
 import (
 	"errors"
@@ -25,7 +25,7 @@ const (
 )
 
 type Field struct {
-	Key        	string
+	Key        string
 	Type       FieldType
 	Bool       bool
 	Bools      []bool
@@ -37,7 +37,7 @@ type Field struct {
 	Integer64s []int64
 	Strings    []string
 	Float64s   []float64
-	Any interface{}
+	Any        interface{}
 }
 
 // Bool

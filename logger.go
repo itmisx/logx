@@ -24,7 +24,7 @@ type Config struct {
 	// 追踪使能
 	EnableTrace bool `yaml:"enable_trace" mapstructure:"enable_trace"`
 	// 日志输出的方式
-	// none为不输出日志，file 为文件方式输出，console为控制台。默认为console
+	// none为不输出日志，file 为文件方式输出，console为控制台。默认为none
 	Output string `yaml:"output" mapstructure:"output"`
 	// 日志文件路径
 	File string `yaml:"file" mapstructure:"file"` // 日志文件路径
@@ -100,9 +100,13 @@ func Init(conf Config, applicationAttributes ...Field) {
 			provider = pd
 		}
 	}
+	// 默认不输出日志
+	if config.Output == "" {
+		config.Output = "none"
+	}
 	if config.Output != "none" {
 		enable_log = true
-		if config.Output == "" || (config.Output != "file" && config.Output != "console") {
+		if config.Output != "file" && config.Output != "console" {
 			config.Output = "console"
 		}
 		zapLogger := newZapLogger(conf)

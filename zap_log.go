@@ -75,7 +75,7 @@ func newZapLogger(conf Config) zapLogger {
 	enco := zapcore.NewJSONEncoder(encoderConfig)
 	var atomicLevel zap.AtomicLevel
 	if conf.Debug {
-		atomicLevel = zap.NewAtomicLevelAt(zap.InfoLevel)
+		atomicLevel = zap.NewAtomicLevelAt(zap.DebugLevel)
 	} else {
 		atomicLevel = zap.NewAtomicLevelAt(zap.ErrorLevel)
 	}

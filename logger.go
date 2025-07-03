@@ -457,8 +457,11 @@ func lokiPush(ctx context.Context, level, msg string, attributes ...Field) {
 		},
 	}
 	jsonBytes, _ := json.Marshal(data)
-	reqClient.
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), time.Second*3)
+	defer reqCancel()
+	go reqClient.
 		R().
+		SetContext(reqCtx).
 		SetHeader("content-type", "application/json").
 		SetBodyJsonBytes(jsonBytes).
 		Post(config.LokiServer)

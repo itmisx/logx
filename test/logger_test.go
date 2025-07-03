@@ -15,11 +15,15 @@ import (
 func TestTrace(*testing.T) {
 	conf := logx.Config{
 		Debug:              true,
+		Output:             "console",
 		EnableTrace:        true,
 		TracerProviderType: "file",
+		LokiServer:         "",
+		LokiUsername:       "",
+		LokiPassword:       "",
 	}
 
-	logx.Init(conf, logx.Int64("ID", 1))
+	logx.Init(conf, logx.Int64("ID", 1), logx.String("service", "local-test"))
 	ctx1 := logx.Start(context.Background(), "test1")
 	defer logx.End(ctx1)
 	logx.Warn(ctx1, "test info", logx.String("name1", "test"))
@@ -30,7 +34,7 @@ func TestTrace(*testing.T) {
 	fmt.Println(logx.TraceID(ctx2))
 	logx.Error(ctx2, "test2 info", logx.String("name2", "test"))
 	logx.Info(ctx2, "test2 info", logx.Bool("sex2", true))
-	logx.Info(ctx2, "test2 info", logx.Int("age2", 30))
+	logx.Debug(ctx2, "test2 info", logx.Any("conf", conf))
 	logx.End(ctx2)
 }
 

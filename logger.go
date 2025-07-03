@@ -2,13 +2,17 @@ package logx
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"runtime"
 	"strconv"
 	"time"
 
+	"github.com/go-playground/validator/v10"
+	"github.com/imroc/req/v3"
 	"go.opentelemetry.io/contrib/propagators/b3"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/trace"
@@ -38,6 +42,12 @@ type Config struct {
 	Compress bool `yaml:"compress" mapstructure:"compress"`
 	// 是否启用日志的切割功能
 	Rotate string `yaml:"rotate" mapstructure:"rotate"`
+	// Loki配置
+	// 一种是直接配置
+	// 一种是在docker中安装插件，并配置容器的log loki选项，由插件自动完成推送
+	LokiServer   string `yaml:"loki_server" mapstructure:"loki_server"`
+	LokiUsername string `yaml:"loki_username" mapstructure:"loki_username"`
+	LokiPassword string `yaml:"loki_password" mapstructure:"loki_password"`
 	// 日志追踪的类型，file or jaeger
 	TracerProviderType string `yaml:"tracer_provider_type" mapstructure:"tracer_provider_type"`
 	// 日志追踪采样的比率, 0.0-1
@@ -58,7 +68,10 @@ var (
 	logger     *zap.Logger
 	config     Config
 	provider   *trace.TracerProvider
+	reqClient  *req.Client
 )
+
+var LokiLabel = map[string]string{}
 
 // save context span
 type LoggerSpanContext struct {
@@ -83,6 +96,17 @@ const (
 func Init(conf Config, applicationAttributes ...Field) {
 	otel.SetTextMapPropagator(b3.New())
 	config = conf
+	req.C()
+	// 设置loki的label
+	validate := validator.New()
+	for _, attr := range applicationAttributes {
+		if attr.Type == stringType && validate.Var(attr.String, "alphanum") == nil {
+			LokiLabel[attr.Key] = attr.String
+		}
+	}
+	if config.LokiServer != "" {
+		reqClient = req.C().SetCommonBasicAuth(config.LokiUsername, config.LokiPassword)
+	}
 	if config.EnableTrace {
 		var pd *trace.TracerProvider
 		if conf.TracerProviderType == "" {
@@ -162,6 +186,9 @@ func Debug(ctx context.Context, msg string, attributes ...Field) {
 	if enable_log {
 		logger.Debug(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
+	if config.LokiServer != "" {
+		lokiPush(ctx, "debug", msg, attributes...)
+	}
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
 		return
@@ -175,6 +202,9 @@ func Debug(ctx context.Context, msg string, attributes ...Field) {
 func Info(ctx context.Context, msg string, attributes ...Field) {
 	if enable_log {
 		logger.Info(msg, FieldsToZapFields(ctx, attributes...)...)
+	}
+	if config.LokiServer != "" {
+		lokiPush(ctx, "info", msg, attributes...)
 	}
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
@@ -190,6 +220,9 @@ func Warn(ctx context.Context, msg string, attributes ...Field) {
 	if enable_log {
 		logger.Warn(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
+	if config.LokiServer != "" {
+		lokiPush(ctx, "warn", msg, attributes...)
+	}
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
 		return
@@ -203,6 +236,9 @@ func Warn(ctx context.Context, msg string, attributes ...Field) {
 func Error(ctx context.Context, msg string, attributes ...Field) {
 	if enable_log {
 		logger.Error(msg, FieldsToZapFields(ctx, attributes...)...)
+	}
+	if config.LokiServer != "" {
+		lokiPush(ctx, "error", msg, attributes...)
 	}
 	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
 	if !ok {
@@ -227,6 +263,9 @@ func Fatal(ctx context.Context, msg string, attributes ...Field) {
 	}()
 	if enable_log {
 		logger.Fatal(msg, FieldsToZapFields(ctx, attributes...)...)
+	}
+	if config.LokiServer != "" {
+		lokiPush(ctx, "fatal", msg, attributes...)
 	}
 }
 
@@ -355,4 +394,72 @@ func randString(len int) string {
 		bytes = append(bytes, seed[r.Intn(15)])
 	}
 	return string(bytes)
+}
+
+func lokiPush(ctx context.Context, level, msg string, attributes ...Field) {
+	if reqClient == nil {
+		return
+	}
+	var kv = map[string]interface{}{}
+	// 日志等级
+	kv["level"] = level
+	// 日志标题
+	kv["msg"] = msg
+	// 日志追踪信息
+	if traceID := TraceID(ctx); traceID != "" {
+		kv["trace_id"] = traceID
+	}
+	if spanID := SpanID(ctx); spanID != "" {
+		kv["span_id"] = spanID
+	}
+	for _, attr := range attributes {
+		switch attr.Type {
+		case boolType:
+			kv[attr.Key] = attr.Bool
+		case boolSliceType:
+			kv[attr.Key] = attr.Bools
+		case intType:
+			kv[attr.Key] = attr.Integer
+		case intSliceType:
+			kv[attr.Key] = attr.Integers
+		case int64Type:
+			kv[attr.Key] = attr.Integer64
+		case int64SliceType:
+			kv[attr.Key] = attr.Integer64s
+		case float64Type:
+			kv[attr.Key] = attr.Float64
+		case float64SliceType:
+			kv[attr.Key] = attr.Float64s
+		case stringType:
+			kv[attr.Key] = attr.String
+		case stringSliceType:
+			kv[attr.Key] = attr.Strings
+		case stringerType:
+			kv[attr.Key] = attr.String
+		case anyType:
+			kv[attr.Key] = attr.Any
+		}
+	}
+	// 获取调用堆栈信息
+	_, file, line, ok := runtime.Caller(2)
+	if !ok {
+		fmt.Println("无法获取调用信息")
+		return
+	}
+	kv["caller"] = fmt.Sprintf("%s:%d", file, line)
+	kvJson, _ := json.Marshal(kv)
+	var data = map[string][]map[string]interface{}{
+		"streams": {
+			{
+				"stream": LokiLabel,
+				"values": [][]interface{}{{strconv.FormatInt(time.Now().UnixNano(), 10), string(kvJson)}},
+			},
+		},
+	}
+	jsonBytes, _ := json.Marshal(data)
+	reqClient.
+		R().
+		SetHeader("content-type", "application/json").
+		SetBodyJsonBytes(jsonBytes).
+		Post(config.LokiServer)
 }

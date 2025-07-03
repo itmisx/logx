@@ -100,7 +100,7 @@ func Init(conf Config, applicationAttributes ...Field) {
 	// 设置loki的label
 	validate := validator.New()
 	for _, attr := range applicationAttributes {
-		if attr.Type == stringType && validate.Var(attr.String, "alphanum") == nil {
+		if attr.Type == stringType && validate.Var(attr.Key, "alphanum") == nil {
 			LokiLabel[attr.Key] = attr.String
 		}
 	}
@@ -457,12 +457,16 @@ func lokiPush(ctx context.Context, level, msg string, attributes ...Field) {
 		},
 	}
 	jsonBytes, _ := json.Marshal(data)
-	reqCtx, reqCancel := context.WithTimeout(context.Background(), time.Second*3)
-	defer reqCancel()
-	go reqClient.
-		R().
-		SetContext(reqCtx).
-		SetHeader("content-type", "application/json").
-		SetBodyJsonBytes(jsonBytes).
-		Post(config.LokiServer)
+	go func() {
+		reqCtx, reqCancel := context.WithTimeout(context.Background(), time.Second*3)
+		defer reqCancel()
+		reqClient.
+			EnableDebugLog().
+			EnableDumpAll().
+			R().
+			SetContext(reqCtx).
+			SetHeader("content-type", "application/json").
+			SetBodyJsonBytes(jsonBytes).
+			Post(config.LokiServer)
+	}()
 }

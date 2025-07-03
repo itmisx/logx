@@ -36,6 +36,7 @@ func TestTrace(*testing.T) {
 	logx.Info(ctx2, "test2 info", logx.Bool("sex2", true))
 	logx.Debug(ctx2, "test2 info", logx.Any("conf", conf))
 	logx.End(ctx2)
+	<-make(chan bool)
 }
 
 func TestCustomizeTraceID(*testing.T) {

@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"regexp"
 	"runtime"
 	"strconv"
 	"time"
 
-	"github.com/go-playground/validator/v10"
 	"github.com/imroc/req/v3"
 	"go.opentelemetry.io/contrib/propagators/b3"
 	"go.opentelemetry.io/otel"
@@ -96,11 +96,10 @@ const (
 func Init(conf Config, applicationAttributes ...Field) {
 	otel.SetTextMapPropagator(b3.New())
 	config = conf
-	req.C()
 	// 设置loki的label
-	validate := validator.New()
+	var reg = regexp.MustCompile(`^[0-9A-Za-z_]+$`)
 	for _, attr := range applicationAttributes {
-		if attr.Type == stringType && validate.Var(attr.Key, "alphanum") == nil {
+		if attr.Type == stringType && reg.MatchString(attr.Key) {
 			LokiLabel[attr.Key] = attr.String
 		}
 	}
@@ -461,8 +460,6 @@ func lokiPush(ctx context.Context, level, msg string, attributes ...Field) {
 		reqCtx, reqCancel := context.WithTimeout(context.Background(), time.Second*3)
 		defer reqCancel()
 		reqClient.
-			EnableDebugLog().
-			EnableDumpAll().
 			R().
 			SetContext(reqCtx).
 			SetHeader("content-type", "application/json").

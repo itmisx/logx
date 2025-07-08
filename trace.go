@@ -1,72 +1,88 @@
 package logx
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"os"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
-	"go.opentelemetry.io/otel/sdk/trace"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 )
 
 type Trace struct{}
 
-// NewJaegerProvider
-func (tx Trace) NewJaegerProvider(conf Config,
+// NewOLTPProvider
+func (tx Trace) NewOLTPProvider(ctx context.Context, conf Config,
 	attributes ...Field,
-) (*trace.TracerProvider, error) {
-	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(conf.JaegerServer),
-		jaeger.WithUsername(conf.JaegerUsername),
-		jaeger.WithPassword(conf.JaegerPassword)))
+) (*sdktrace.TracerProvider, error) {
+	var options []otlptracehttp.Option
+	if conf.OTLPEndpoint != "" {
+		options = append(options, otlptracehttp.WithEndpoint(conf.OTLPEndpoint))
+	}
+	if conf.OTLPEndpointURLPath != "" {
+		options = append(options, otlptracehttp.WithURLPath(conf.OTLPEndpointURLPath))
+	}
+	if conf.OLTPInsecure {
+		options = append(options, otlptracehttp.WithInsecure())
+	}
+	if conf.OTLPToken != "" {
+		options = append(options, otlptracehttp.WithHeaders(map[string]string{
+			"Authorization": "Basic " + conf.OTLPToken,
+		}))
+	}
+	// the collected spans.
+	exporter, err := otlptrace.New(context.Background(), otlptracehttp.NewClient(
+		options...,
+	))
 	if err != nil {
 		return nil, err
 	}
-	if conf.TraceSampleRatio > 1 {
-		conf.TraceSampleRatio = 1
-	}
-	if conf.TraceSampleRatio < 0 {
-		conf.TraceSampleRatio = 0
-	}
-	tp := trace.NewTracerProvider(
-		// Always be sure to batch in production.
-		trace.WithBatcher(exp),
-		// Record information about this application in an Resource.
-		trace.WithResource(resource.NewWithAttributes(
+
+	// For the demonstration, use sdktrace.AlwaysSample sampler to sample all traces.
+	// In a production application, use sdktrace.ProbabilitySampler with a desired probability.
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(
+			sdktrace.TraceIDRatioBased(conf.TraceSampleRatio), // 没父 span 的时候按 10 % 随机采样
+		),
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			FieldsToKeyValues(attributes...)...,
 		)),
-		trace.WithSampler(trace.TraceIDRatioBased(conf.TraceSampleRatio)),
 	)
-
 	otel.SetTracerProvider(tp)
-	return tp, nil
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	return tp, err
 }
 
 // NewFileProvider
-func (tx Trace) NewFileProvider(conf Config, attributes ...Field) (*trace.TracerProvider, error) {
+func (tx Trace) NewFileProvider(conf Config, attributes ...Field) (*sdktrace.TracerProvider, error) {
 	f, _ := os.Create("trace.txt")
 	exp, _ := newExporter(f)
-	tp := trace.NewTracerProvider(
+	tp := sdktrace.NewTracerProvider(
 		// Always be sure to batch in production.
-		trace.WithBatcher(exp),
+		sdktrace.WithBatcher(exp),
 		// Record information about this application in an Resource.
-		trace.WithResource(resource.NewWithAttributes(
+		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			FieldsToKeyValues(attributes...)...,
 		)),
-		trace.WithSampler(trace.AlwaysSample()),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 
 	otel.SetTracerProvider(tp)
 	return tp, nil
 }
 
-func newExporter(w io.Writer) (trace.SpanExporter, error) {
+func newExporter(w io.Writer) (sdktrace.SpanExporter, error) {
 	return stdouttrace.New(
 		stdouttrace.WithWriter(w),
 		// Use human-readable output.

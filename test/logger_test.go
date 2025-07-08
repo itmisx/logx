@@ -14,18 +14,20 @@ import (
 
 func TestTrace(*testing.T) {
 	conf := logx.Config{
-		Debug:              true,
-		Output:             "console",
-		EnableTrace:        true,
-		TracerProviderType: "file",
-		LokiServer:         "",
-		LokiUsername:       "",
-		LokiPassword:       "",
+		Debug:               true,
+		Output:              "console",
+		LokiServer:          "",
+		LokiUsername:        "",
+		LokiPassword:        "",
+		EnableTrace:         true,
+		TraceSampleRatio:    1,
+		OTLPEndpoint:        "otlp-gateway-prod-ap-southeast-1.grafana.net",
+		OTLPEndpointURLPath: "/otlp/v1/traces",
+		OTLPToken:           "",
 	}
 
-	logx.Init(conf, logx.Int64("ID", 1), logx.String("service", "local-test"))
-	ctx1 := logx.Start(context.Background(), "test1")
-	defer logx.End(ctx1)
+	logx.Init(conf, logx.Int64("ID", 1), logx.String("service.name", "local-test"))
+	ctx1 := logx.Start(context.Background(), "test1", logx.String("service.name", "local-test"))
 	logx.Warn(ctx1, "test info", logx.String("name1", "test"))
 	logx.Error(ctx1, "test info", logx.Bool("sex1", true))
 	logx.Error(ctx1, "test info", logx.Int("age1", 30))
@@ -36,7 +38,8 @@ func TestTrace(*testing.T) {
 	logx.Info(ctx2, "test2 info", logx.Bool("sex2", true))
 	logx.Debug(ctx2, "test2 info", logx.Any("conf", conf))
 	logx.End(ctx2)
-	<-make(chan bool)
+	logx.End(ctx1)
+	time.Sleep(time.Second * 7)
 }
 
 func TestCustomizeTraceID(*testing.T) {
@@ -88,7 +91,6 @@ func TestPropagationWithGlobalPropagators(t *testing.T) {
 			EnableTrace:        true,
 			TracerProviderType: "file",
 			TraceSampleRatio:   1,
-			JaegerServer:       "http://120.77.213.80:14268/api/traces",
 		}
 		logx.Init(conf, logx.Int64("ID", 1))
 	}

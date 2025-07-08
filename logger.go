@@ -25,8 +25,6 @@ import (
 type Config struct {
 	// 是否开启debug模式，未开启debug模式，仅记录错误
 	Debug bool `yaml:"debug" mapstructure:"debug"`
-	// 追踪使能
-	EnableTrace bool `yaml:"enable_trace" mapstructure:"enable_trace"`
 	// 日志输出的方式
 	// none为不输出日志，file 为文件方式输出，console为控制台。默认为none
 	Output string `yaml:"output" mapstructure:"output"`
@@ -48,19 +46,21 @@ type Config struct {
 	LokiServer   string `yaml:"loki_server" mapstructure:"loki_server"`
 	LokiUsername string `yaml:"loki_username" mapstructure:"loki_username"`
 	LokiPassword string `yaml:"loki_password" mapstructure:"loki_password"`
-	// 日志追踪的类型，file or jaeger
+	// 追踪使能
+	EnableTrace bool `yaml:"enable_trace" mapstructure:"enable_trace"`
+	// 日志追踪的类型，file/oltp，默认oltp
 	TracerProviderType string `yaml:"tracer_provider_type" mapstructure:"tracer_provider_type"`
 	// 日志追踪采样的比率, 0.0-1
 	// 0,never trace
 	// 1,always trace
 	TraceSampleRatio float64 `yaml:"trace_sample_ratio" mapstructure:"trace_sample_ratio"`
-	// 最大span数量限制，当达到最大限制时，停止trace
-	// default 200
-	MaxSpan int `yaml:"max_span" mapstructure:"max_span"`
-	// Jaeger server
-	JaegerServer   string `yaml:"jaeger_server" mapstructure:"jaeger_server"`
-	JaegerUsername string `yaml:"jaeger_username" mapstructure:"jaeger_username"`
-	JaegerPassword string `yaml:"jaeger_password" mapstructure:"jaeger_password"`
+	// 默认使用https，为false时，使用http
+	OLTPInsecure bool `yaml:"oltp_insecure" mapstructure:"oltp_insecure"`
+	// oltp endpoint 将trace data发送到该地址
+	OTLPEndpoint        string `yaml:"oltp_endpoint" mapstructure:"oltp_endpoint"`
+	OTLPEndpointURLPath string `yaml:"oltp_endpoint_url_path" mapstructure:"oltp_endpoint_url_path"`
+	// 用户basic auth
+	OTLPToken string `yaml:"oltp_token" mapstructure:"oltp_token"`
 }
 
 var (
@@ -109,13 +109,14 @@ func Init(conf Config, applicationAttributes ...Field) {
 	if config.EnableTrace {
 		var pd *trace.TracerProvider
 		if conf.TracerProviderType == "" {
-			conf.TracerProviderType = "jaeger"
+			conf.TracerProviderType = "oltp"
 		}
-		if conf.TracerProviderType == "jaeger" {
-			pd, _ = Trace{}.NewJaegerProvider(conf, applicationAttributes...)
-		} else if conf.TracerProviderType == "file" {
+		switch conf.TracerProviderType {
+		case "oltp":
+			pd, _ = Trace{}.NewOLTPProvider(context.Background(), conf, applicationAttributes...)
+		case "file":
 			pd, _ = Trace{}.NewFileProvider(conf, applicationAttributes...)
-		} else {
+		default:
 			log.Fatal("Unsupported tracerProvider type")
 		}
 
@@ -135,9 +136,6 @@ func Init(conf Config, applicationAttributes ...Field) {
 		zapLogger := newZapLogger(conf)
 		logger = zapLogger.Logger
 		zapLogger.rotateCrond(conf)
-	}
-	if config.MaxSpan == 0 {
-		config.MaxSpan = 200
 	}
 }
 

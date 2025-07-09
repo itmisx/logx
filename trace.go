@@ -20,7 +20,10 @@ import (
 type Trace struct{}
 
 // NewOLTPProvider
-func (tx Trace) NewOLTPProvider(ctx context.Context, conf Config,
+func (tx Trace) NewOLTPProvider(
+	ctx context.Context,
+	conf Config,
+	serviceName string,
 	attributes ...Field,
 ) (*sdktrace.TracerProvider, error) {
 	var options []otlptracehttp.Option
@@ -46,6 +49,7 @@ func (tx Trace) NewOLTPProvider(ctx context.Context, conf Config,
 		return nil, err
 	}
 
+	attributes = append(attributes, String("service.name", serviceName))
 	// For the demonstration, use sdktrace.AlwaysSample sampler to sample all traces.
 	// In a production application, use sdktrace.ProbabilitySampler with a desired probability.
 	tp := sdktrace.NewTracerProvider(
@@ -64,9 +68,10 @@ func (tx Trace) NewOLTPProvider(ctx context.Context, conf Config,
 }
 
 // NewFileProvider
-func (tx Trace) NewFileProvider(conf Config, attributes ...Field) (*sdktrace.TracerProvider, error) {
+func (tx Trace) NewFileProvider(conf Config, serviceName string, attributes ...Field) (*sdktrace.TracerProvider, error) {
 	f, _ := os.Create("trace.txt")
 	exp, _ := newExporter(f)
+	attributes = append(attributes, String("service.name", serviceName))
 	tp := sdktrace.NewTracerProvider(
 		// Always be sure to batch in production.
 		sdktrace.WithBatcher(exp),

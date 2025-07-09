@@ -26,7 +26,7 @@ func TestTrace(*testing.T) {
 		OTLPToken:           "",
 	}
 
-	logx.Init(conf, logx.Int64("ID", 1), logx.String("service.name", "local-test"))
+	logx.Init(conf, "local-test", logx.Int64("ID", 1))
 	ctx1 := logx.Start(context.Background(), "test1", logx.String("service.name", "local-test"))
 	logx.Warn(ctx1, "test info", logx.String("name1", "test"))
 	logx.Error(ctx1, "test info", logx.Bool("sex1", true))
@@ -51,7 +51,7 @@ func TestCustomizeTraceID(*testing.T) {
 		Rotate:             "0 * * * * *",
 		TracerProviderType: "file",
 	}
-	logx.Init(conf, logx.Int64("ID", 1))
+	logx.Init(conf, "local-test", logx.Int64("ID", 1))
 	traceID := logx.GenTraceID()
 	spanID := logx.GenSpanID()
 	ctx, err := logx.NewRootContext(traceID, spanID)
@@ -74,7 +74,7 @@ func TestLog(*testing.T) {
 		Rotate: "0 * * * * *",
 	}
 	ctx := context.Background()
-	logx.Init(conf)
+	logx.Init(conf, "local-test")
 	for {
 		logx.Info(ctx, "log info")
 		logx.Warn(ctx, "log warn")
@@ -92,7 +92,7 @@ func TestPropagationWithGlobalPropagators(t *testing.T) {
 			TracerProviderType: "file",
 			TraceSampleRatio:   1,
 		}
-		logx.Init(conf, logx.Int64("ID", 1))
+		logx.Init(conf, "local-test", logx.Int64("ID", 1))
 	}
 
 	// new gin server
@@ -143,7 +143,7 @@ func TestMaxspan(*testing.T) {
 		TracerProviderType: "file",
 	}
 
-	logx.Init(conf, logx.Int64("ID", 1))
+	logx.Init(conf, "local-test", logx.Int64("ID", 1))
 	ctx1 := logx.Start(context.Background(), "test1")
 	defer logx.End(ctx1)
 	logx.Warn(ctx1, "test info", logx.String("name1", "test"))

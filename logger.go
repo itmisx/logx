@@ -88,17 +88,20 @@ const (
 // LoggerInit logger初始化
 //
 // applicationAttributes 应用属性，如应用的名称，版本等
-// can use service.name,service.namesapce,service.instance.id,service.version,
+// 可以使用 service.name,service.namesapce,service.instance.id,service.version,
 // telemetry.sdk.name,telemetry.sdk.language,telemetry.sdk.version,telemetry.auto.version
-// or other key that you need
+// or other key that you need 主要用于追踪label
+//
+// 日志的label不支持*.*格式，会被过滤掉
 //
 // example:
 // Init(conf,String("sevice.name",service1))
-func Init(conf Config, applicationAttributes ...Field) {
+func Init(conf Config, serviceName string, applicationAttributes ...Field) {
 	otel.SetTextMapPropagator(b3.New())
 	config = conf
 	// 设置loki的label
 	var reg = regexp.MustCompile(`^[0-9A-Za-z_]+$`)
+	LokiLabel["service_name"] = serviceName
 	for _, attr := range applicationAttributes {
 		if attr.Type == stringType && reg.MatchString(attr.Key) {
 			LokiLabel[attr.Key] = attr.String
@@ -114,9 +117,9 @@ func Init(conf Config, applicationAttributes ...Field) {
 		}
 		switch conf.TracerProviderType {
 		case "oltp":
-			pd, _ = Trace{}.NewOLTPProvider(context.Background(), conf, applicationAttributes...)
+			pd, _ = Trace{}.NewOLTPProvider(context.Background(), conf, serviceName, applicationAttributes...)
 		case "file":
-			pd, _ = Trace{}.NewFileProvider(conf, applicationAttributes...)
+			pd, _ = Trace{}.NewFileProvider(conf, serviceName, applicationAttributes...)
 		default:
 			log.Fatal("Unsupported tracerProvider type")
 		}

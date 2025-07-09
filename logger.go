@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -160,7 +161,7 @@ func Start(ctx context.Context, spanName string, spanStartOption ...Field) conte
 		loggerSpanContext.span = span
 	} else {
 		// 如果trace失能，将会创建一个noop traceProvider
-		spanContext, span = oteltrace.NewNoopTracerProvider().Tracer("").Start(ctx, spanName)
+		spanContext, span = noop.NewTracerProvider().Tracer("").Start(ctx, spanName)
 		loggerSpanContext.span = span
 	}
 	startCtx := context.WithValue(spanContext, loggerSpanContextKey, loggerSpanContext)

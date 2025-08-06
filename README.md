@@ -8,14 +8,20 @@ logger wraps uber/zap and trace with opentelemetry
 
 ```mermaid
 flowchart LR
-logger -- openTelemetrySDK --> trace
-trace -- http --> tempo
+logger  e1@-- openTelemetrySDK --> trace
+e1@{ animate: true }
+trace e2@-- http --> tempo
+e2@{ animate: true }
 
-logger -- zap --> log
-log-->loki
+logger e3@-- zap --> log
+e3@{ animate: true }
+log e4@-->loki
+e4@{ animate: true }
 
-tempo-->grafana
-loki-->grafana
+tempo e5@-->grafana
+e5@{ animate: true }
+loki e6@-->grafana
+e6@{ animate: true }
 
 ```
 

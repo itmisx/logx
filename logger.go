@@ -85,6 +85,9 @@ const (
 	loggerSpanContextKey LoggerContextKey = iota
 )
 
+// Fatal中强制导出span的超时时间
+const flushTimeout = 5 * time.Second
+
 // LoggerInit logger初始化
 //
 // applicationAttributes 应用属性，如应用的名称，版本等
@@ -251,22 +254,31 @@ func Error(ctx context.Context, msg string, attributes ...Field) {
 }
 
 // Fatal record fatal
+//
+// 注意：zap的Fatal内部会调用os.Exit(1)，os.Exit不会执行defer，
+// 所以必须先记录span、推送loki并强制导出，最后再输出日志退出
 func Fatal(ctx context.Context, msg string, attributes ...Field) {
-	defer func() {
-		loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
-		if !ok {
-			return
-		}
+	if loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext); ok {
 		if config.EnableTrace {
 			// add error logs
 			loggerSpanContext.span.RecordError(errors.New(msg), oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
+			// span未结束不会进入导出队列，这里主动结束
+			// span.End重复调用是安全的，不影响调用方的 defer End(ctx)
+			loggerSpanContext.span.End()
 		}
-	}()
-	if enable_log {
-		logger.Fatal(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
 	if config.LokiServer != "" {
 		lokiPush(ctx, "fatal", msg, attributes...)
+	}
+	// 进程即将退出，强制导出缓存的span，否则batcher中的数据会丢失
+	// 传入的ctx可能已被取消，这里用独立的超时ctx
+	if provider != nil {
+		flushCtx, cancel := context.WithTimeout(context.Background(), flushTimeout)
+		_ = provider.ForceFlush(flushCtx)
+		cancel()
+	}
+	if enable_log {
+		logger.Fatal(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
 }
 
@@ -344,6 +356,29 @@ func End(ctx context.Context) {
 	if config.EnableTrace {
 		loggerSpanContext.span.End()
 	}
+}
+
+// Flush 立即将缓存中的span导出，不关闭provider
+// 未开启追踪时为空操作
+func Flush(ctx context.Context) error {
+	if provider == nil {
+		return nil
+	}
+	return provider.ForceFlush(ctx)
+}
+
+// Shutdown 导出缓存中的span并关闭provider
+// 应在进程正常退出前调用，否则batcher中缓存的span会丢失
+// 未开启追踪时为空操作
+//
+// example:
+// logx.Init(conf,"my-service")
+// defer logx.Shutdown(context.Background())
+func Shutdown(ctx context.Context) error {
+	if provider == nil {
+		return nil
+	}
+	return provider.Shutdown(ctx)
 }
 
 // FieldsToZapFields

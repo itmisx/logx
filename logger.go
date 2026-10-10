@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/imroc/req/v3"
-	"go.opentelemetry.io/contrib/propagators/b3"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -112,7 +111,9 @@ const flushTimeout = 5 * time.Second
 // example:
 // Init(conf,String("sevice.name",service1))
 func Init(conf Config, serviceName string, applicationAttributes ...Field) {
-	otel.SetTextMapPropagator(b3.New())
+	// 全局propagator与tracePropagator保持一致
+	// 便于直接使用otel生态的其他instrumentation
+	otel.SetTextMapPropagator(tracePropagator)
 	config = conf
 	// 解析日志等级，必须在newZapLogger之前完成
 	atomicLevel.SetLevel(parseLevel(conf.Level, conf.Debug))

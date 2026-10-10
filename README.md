@@ -32,7 +32,7 @@
 - **五级日志等级** —— `debug` / `info` / `warn` / `error` / `fatal`，支持运行时动态调整
 - **通用 OTLP 导出** —— 可对接 Tempo、Jaeger、OpenTelemetry Collector 及各类兼容后端
 - **日志文件切分** —— 基于 [lumberjack](https://github.com/natefinch/lumberjack)，支持按大小切分与 cron 定时切分
-- **跨服务链路传递** —— 内置 HTTP 注入与 Gin 中间件，也支持手动构造根 context
+- **跨服务链路传递** —— 内置 HTTP 注入提取与 Gin 中间件，同时支持 B3 与 W3C Trace Context 两种格式，也可手动传递 header
 - **异常自动恢复** —— `defer logx.End(ctx)` 同时完成 span 结束与 panic 恢复
 
 ## 架构
@@ -269,8 +269,47 @@ func handler(c *gin.Context) {
 }
 ```
 
+> `logx.GinMiddleware` 使用与 `HttpInject` / `TraceHeaders` 完全一致的 propagator，无需额外配置。
 > 需要自定义 propagator 或 tracer provider 时，可直接使用
 > `github.com/itmisx/logx/propagation/extract` 下的 `GinMiddleware(service, extract.WithPropagators(...))`。
+
+### 手动传递 header
+
+适用于无法直接使用 `HttpInject` 的场景，例如消息队列、gRPC metadata、自行封装的 HTTP 客户端。
+
+```go
+// 上游：导出当前 span 的追踪 header
+func produce(ctx context.Context, msg *Message) {
+    for k, v := range logx.TraceHeaders(ctx) {
+        msg.Header.Set(k, v)
+    }
+}
+
+// 下游：从 header 还原 context，再 Start 即为上游 span 的子 span
+func consume(msg *Message) {
+    ctx := logx.ContextFromHeaders(context.Background(), msg.Headers())
+    ctx = logx.Start(ctx, "consume")
+    defer logx.End(ctx)
+
+    logx.Info(ctx, "开始消费")
+}
+```
+
+- `TraceHeaders` 在**未开启追踪时返回 `nil`** —— 此时 span 为 noop，trace/span ID 全为 0，不会向下游发送无效 header
+- 返回的 key 为 HTTP 规范化形式（`B3`、`Traceparent`），用于 gRPC metadata 等要求小写 key 的场景时需自行转换
+- `ContextFromHeaders` 的 key **大小写不敏感**，B3 单 header、B3 多 header、W3C `traceparent` 三种格式都能识别
+- header 中没有有效追踪信息时原样返回传入的 ctx，后续 `Start` 会开启一条新的 trace
+
+服务端也可直接从 `*http.Request` 提取，与 `HttpInject` 对应：
+
+```go
+func handler(w http.ResponseWriter, r *http.Request) {
+    ctx := logx.Start(logx.HttpExtract(r.Context(), r), "handler")
+    defer logx.End(ctx)
+
+    logx.Info(ctx, "received")
+}
+```
 
 ### 手动构造根 context
 
@@ -408,6 +447,9 @@ logx.Config{
 | 函数 | 说明 |
 | --- | --- |
 | `HttpInject(ctx, req *http.Request) error` | 将 span 信息注入 HTTP 请求头 |
+| `HttpExtract(ctx, req *http.Request) context.Context` | 从 HTTP 请求头提取上游 span 信息 |
+| `TraceHeaders(ctx) map[string]string` | 导出当前 span 的追踪 header，未开启追踪时返回 `nil` |
+| `ContextFromHeaders(ctx, headers map[string]string) context.Context` | 从追踪 header 还原 context |
 | `GinMiddleware(service string) gin.HandlerFunc` | Gin 中间件，从请求头提取上游 span 信息 |
 
 ### Field 类型
@@ -432,7 +474,7 @@ logx.Err(err)                    // 固定使用 error 作为 key
 - **单个 span 的 event 数量有上限**。OpenTelemetry SDK 默认每个 span 最多 128 个 event，超出部分会被静默丢弃。长生命周期的 span 应拆分为多个子 span。
 - **没有 span 的 ctx 不会产生 event**。未经 `Start` 的 context（如进程启动阶段、未传递 ctx 的定时任务）调用日志方法时，本地日志和 Loki 正常写入，但不会产生 span event。
 - **`Fatal` 会结束进程**。它会先记录 span、推送 Loki、强制导出追踪数据，然后以退出码 `1` 退出，其后的代码不会执行。
-- **传播格式为 W3C Trace Context**。开启 OTLP 追踪时使用 `TraceContext` + `Baggage`；若上游服务使用 B3 格式传递，链路会在此处断开。
+- **传播格式同时支持 B3 与 W3C Trace Context**。注入时两种 header 都会写入（`b3` 与 `traceparent`），提取时两种格式都能识别，因此与只认其中一种格式的上下游均可对接。
 - **`TracerProviderType` 配置了不支持的值会导致进程退出**（`log.Fatal`），仅接受 `oltp` 与 `file`。
 
 ## 效果预览

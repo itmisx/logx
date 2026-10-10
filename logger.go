@@ -213,7 +213,9 @@ func Start(ctx context.Context, spanName string, spanStartOption ...Field) conte
 	if config.EnableTrace {
 		enableTrace = true
 	}
-	spanName = spanName + " | " + time.Now().Format("15:04:05")
+	// 注意：不要把时间戳等可变内容拼进spanName
+	// span自带StartTime/EndTime，且spanName是后端的聚合键，
+	// 高基数会打爆Jaeger的operation列表和span metrics
 	// 根据条件
 	// 如果未开启追踪，则返回一个nooptreace，意味着将不再追踪
 	if enableTrace {

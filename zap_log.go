@@ -73,12 +73,8 @@ func newZapLogger(conf Config) zapLogger {
 	// logLevel
 	// Encoder console or json
 	enco := zapcore.NewJSONEncoder(encoderConfig)
-	var atomicLevel zap.AtomicLevel
-	if conf.Debug {
-		atomicLevel = zap.NewAtomicLevelAt(zap.DebugLevel)
-	} else {
-		atomicLevel = zap.NewAtomicLevelAt(zap.ErrorLevel)
-	}
+	// 等级使用包级的atomicLevel，由Init中的parseLevel设置
+	// 以便SetLevel可以在运行时调整
 
 	// new core config
 	core := zapcore.NewCore(

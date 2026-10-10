@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/imroc/req/v3"
@@ -25,7 +27,14 @@ import (
 // Config 配置项
 type Config struct {
 	// 是否开启debug模式，未开启debug模式，仅记录错误
+	//
+	// Deprecated: 使用Level替代，仅在Level为空时生效
 	Debug bool `yaml:"debug" mapstructure:"debug"`
+	// 日志等级，可选debug/info/warn/error/fatal，低于该等级的日志不会被记录
+	// 同时作用于本地日志、loki推送和span event
+	//
+	// 为空时由Debug推导，Debug为true等价于debug，为false等价于error
+	Level string `yaml:"level" mapstructure:"level"`
 	// 日志输出的方式
 	// none为不输出日志，file 为文件方式输出，console为控制台。默认为none
 	Output string `yaml:"output" mapstructure:"output"`
@@ -70,6 +79,9 @@ var (
 	config     Config
 	provider   *trace.TracerProvider
 	reqClient  *req.Client
+	// 日志等级，zap.AtomicLevel并发安全，支持运行时调整
+	// 初始值在Init中由parseLevel设置
+	atomicLevel = zap.NewAtomicLevelAt(zapcore.ErrorLevel)
 )
 
 var LokiLabel = map[string]string{}
@@ -102,6 +114,8 @@ const flushTimeout = 5 * time.Second
 func Init(conf Config, serviceName string, applicationAttributes ...Field) {
 	otel.SetTextMapPropagator(b3.New())
 	config = conf
+	// 解析日志等级，必须在newZapLogger之前完成
+	atomicLevel.SetLevel(parseLevel(conf.Level, conf.Debug))
 	// 设置loki的label
 	var reg = regexp.MustCompile(`^[0-9A-Za-z_]+$`)
 	LokiLabel["service_name"] = serviceName
@@ -146,6 +160,45 @@ func Init(conf Config, serviceName string, applicationAttributes ...Field) {
 	}
 }
 
+// parseLevel 解析日志等级
+//
+// level为空时由debug推导，用于兼容旧配置
+func parseLevel(level string, debug bool) zapcore.Level {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return zapcore.DebugLevel
+	case "info":
+		return zapcore.InfoLevel
+	case "warn", "warning":
+		return zapcore.WarnLevel
+	case "error":
+		return zapcore.ErrorLevel
+	case "fatal":
+		return zapcore.FatalLevel
+	case "":
+		if debug {
+			return zapcore.DebugLevel
+		}
+		return zapcore.ErrorLevel
+	default:
+		log.Printf("logx: unsupported log level %q, use info instead", level)
+		return zapcore.InfoLevel
+	}
+}
+
+// SetLevel 运行时调整日志等级，并发安全
+//
+// 同时作用于本地日志、loki推送和span event
+// 不支持的等级将回退为info
+func SetLevel(level string) {
+	atomicLevel.SetLevel(parseLevel(level, config.Debug))
+}
+
+// GetLevel 返回当前的日志等级
+func GetLevel() string {
+	return atomicLevel.Level().String()
+}
+
 // Start 启动一个span追踪
 // ctx 上级span
 // spanName span名字
@@ -187,6 +240,9 @@ func SetSpanAttr(ctx context.Context, attributes ...Field) {
 
 // Debug record debug
 func Debug(ctx context.Context, msg string, attributes ...Field) {
+	if !atomicLevel.Enabled(zapcore.DebugLevel) {
+		return
+	}
 	if enable_log {
 		logger.Debug(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
@@ -204,6 +260,9 @@ func Debug(ctx context.Context, msg string, attributes ...Field) {
 
 // Info record info
 func Info(ctx context.Context, msg string, attributes ...Field) {
+	if !atomicLevel.Enabled(zapcore.InfoLevel) {
+		return
+	}
 	if enable_log {
 		logger.Info(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
@@ -221,6 +280,9 @@ func Info(ctx context.Context, msg string, attributes ...Field) {
 
 // Warn record warn
 func Warn(ctx context.Context, msg string, attributes ...Field) {
+	if !atomicLevel.Enabled(zapcore.WarnLevel) {
+		return
+	}
 	if enable_log {
 		logger.Warn(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
@@ -238,6 +300,9 @@ func Warn(ctx context.Context, msg string, attributes ...Field) {
 
 // Error record error
 func Error(ctx context.Context, msg string, attributes ...Field) {
+	if !atomicLevel.Enabled(zapcore.ErrorLevel) {
+		return
+	}
 	if enable_log {
 		logger.Error(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
@@ -254,6 +319,8 @@ func Error(ctx context.Context, msg string, attributes ...Field) {
 }
 
 // Fatal record fatal
+//
+// fatal是最高等级，不受Level过滤，总是会被记录
 //
 // 注意：zap的Fatal内部会调用os.Exit(1)，os.Exit不会执行defer，
 // 所以必须先记录span、推送loki并强制导出，最后再输出日志退出
@@ -278,8 +345,12 @@ func Fatal(ctx context.Context, msg string, attributes ...Field) {
 		cancel()
 	}
 	if enable_log {
+		// zap的Fatal内部会调用os.Exit(1)
 		logger.Fatal(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
+	// Output为none时logger未初始化，zap不会退出进程
+	// 这里补上退出，保证Fatal在任何配置下语义一致
+	os.Exit(1)
 }
 
 // TraceID return traceID

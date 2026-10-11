@@ -228,7 +228,10 @@ func spanFromContext(ctx context.Context) oteltrace.Span {
 // 且spanName是后端的聚合键，高基数会打爆Jaeger的operation列表和span metrics
 // spanStartOption span附带属性
 //
-// 返回的end必须直接以 defer end() 的形式调用：
+// 返回的end用于结束span，它不会取消ctx——
+// ctx的Done通道、deadline都不受影响，end之后ctx仍可继续使用
+//
+// end必须直接以 defer end() 的形式调用：
 // 它在panic发生时负责记录并结束span，而recover只在被defer的函数中
 // 直接调用才生效，写成 defer func(){ end() }() 会使panic记录失效
 //
@@ -238,21 +241,21 @@ func spanFromContext(ctx context.Context) oteltrace.Span {
 // example:
 // ctx, end := logx.Start(ctx, "queryDB")
 // defer end()
-func Start(ctx context.Context, spanName string, spanStartOption ...Field) (context.Context, func()) {
+func Start(ctx context.Context, spanName string, spanStartOption ...Field) (spanCtx context.Context, end func()) {
 	var span oteltrace.Span
 	// provider可能因构造失败而为nil，此时退化为noop
 	if config.EnableTrace && provider != nil {
-		ctx, span = provider.Tracer("").Start(ctx, spanName, oteltrace.WithAttributes(FieldsToKeyValues(spanStartOption...)...))
+		spanCtx, span = provider.Tracer("").Start(ctx, spanName, oteltrace.WithAttributes(FieldsToKeyValues(spanStartOption...)...))
 	} else {
 		// 追踪失能时使用noop tracer
 		// 它会保留上游传来的spanContext，因此traceID仍可透传
-		ctx, span = noopProvider.Tracer("").Start(ctx, spanName)
+		spanCtx, span = noopProvider.Tracer("").Start(ctx, spanName)
 	}
-	endCtx := ctx
-	return ctx, func() {
+	logCtx := spanCtx
+	return spanCtx, func() {
 		// recover必须在这里直接调用，不能再往下包一层函数
 		if err := recover(); err != nil {
-			recordPanic(endCtx, span, err)
+			recordPanic(logCtx, span, err)
 			// span必须在重新抛出之前结束，否则不会进入导出队列
 			span.End()
 			// 原样抛出，交回上层（如gin.Recovery）处理

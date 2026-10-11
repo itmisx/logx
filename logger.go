@@ -10,12 +10,14 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/imroc/req/v3"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -59,9 +61,12 @@ type Config struct {
 	EnableTrace bool `yaml:"enable_trace" mapstructure:"enable_trace"`
 	// 日志追踪的类型，file/oltp，默认oltp
 	TracerProviderType string `yaml:"tracer_provider_type" mapstructure:"tracer_provider_type"`
-	// 日志追踪采样的比率, 0.0-1
-	// 0,never trace
-	// 1,always trace
+	// 根span的采样率, 0.0-1
+	// 取值不在(0,1]范围内时（含未设置）按全量采样处理
+	// 要关闭追踪请使用EnableTrace，而不是把该值设为0
+	//
+	// 采样是ParentBased的：上游已有采样决策时直接沿用，
+	// 该比率只对根span生效
 	TraceSampleRatio float64 `yaml:"trace_sample_ratio" mapstructure:"trace_sample_ratio"`
 	// 默认使用https，为false时，使用http
 	OLTPInsecure bool `yaml:"oltp_insecure" mapstructure:"oltp_insecure"`
@@ -81,20 +86,11 @@ var (
 	// 日志等级，zap.AtomicLevel并发安全，支持运行时调整
 	// 初始值在Init中由parseLevel设置
 	atomicLevel = zap.NewAtomicLevelAt(zapcore.ErrorLevel)
+	// 追踪失能时使用的noop provider，无状态，可全局复用
+	noopProvider = noop.NewTracerProvider()
 )
 
 var LokiLabel = map[string]string{}
-
-// save context span
-type LoggerSpanContext struct {
-	span oteltrace.Span
-}
-
-type LoggerContextKey int
-
-const (
-	loggerSpanContextKey LoggerContextKey = iota
-)
 
 // Fatal中强制导出span的超时时间
 const flushTimeout = 5 * time.Second
@@ -128,21 +124,31 @@ func Init(conf Config, serviceName string, applicationAttributes ...Field) {
 	if config.LokiServer != "" {
 		reqClient = req.C().SetCommonBasicAuth(config.LokiUsername, config.LokiPassword)
 	}
+	// 重复Init时先关闭旧的provider
+	// 否则其BatchSpanProcessor的常驻goroutine会泄漏
+	if provider != nil {
+		_ = provider.Shutdown(context.Background())
+		provider = nil
+	}
 	if config.EnableTrace {
 		var pd *trace.TracerProvider
+		var err error
 		if conf.TracerProviderType == "" {
 			conf.TracerProviderType = "oltp"
 		}
 		switch conf.TracerProviderType {
 		case "oltp":
-			pd, _ = Trace{}.NewOLTPProvider(context.Background(), conf, serviceName, applicationAttributes...)
+			pd, err = Trace{}.NewOLTPProvider(context.Background(), conf, serviceName, applicationAttributes...)
 		case "file":
-			pd, _ = Trace{}.NewFileProvider(conf, serviceName, applicationAttributes...)
+			pd, err = Trace{}.NewFileProvider(conf, serviceName, applicationAttributes...)
 		default:
 			log.Fatal("Unsupported tracerProvider type")
 		}
-
-		if pd != nil {
+		// provider构造失败时关掉追踪，否则Start会空指针
+		if err != nil || pd == nil {
+			log.Printf("logx: create tracer provider failed: %v, trace disabled", err)
+			config.EnableTrace = false
+		} else {
 			provider = pd
 		}
 	}
@@ -200,44 +206,99 @@ func GetLevel() string {
 	return atomicLevel.Level().String()
 }
 
-// Start 启动一个span追踪
+// spanFromContext 取出ctx中当前生效的span
+//
+// 直接读取otel的context，因此总是拿到最内层的那个span：
+// 无论它由Start、GinMiddleware还是otelhttp/otelgrpc等
+// 第三方instrumentation创建，日志都会记录到正确的span上
+//
+// ctx中没有有效span时返回nil
+func spanFromContext(ctx context.Context) oteltrace.Span {
+	if span := oteltrace.SpanFromContext(ctx); span.SpanContext().IsValid() {
+		return span
+	}
+	return nil
+}
+
+// Start 启动一个span追踪，返回新的ctx和结束该span的函数
+//
 // ctx 上级span
-// spanName span名字
+// spanName span名字，必须是低基数的固定值
+// 不要拼接时间戳、ID等可变内容，span自带StartTime/EndTime，
+// 且spanName是后端的聚合键，高基数会打爆Jaeger的operation列表和span metrics
 // spanStartOption span附带属性
-func Start(ctx context.Context, spanName string, spanStartOption ...Field) context.Context {
-	var loggerSpanContext LoggerSpanContext
-	var spanContext context.Context
-	var enableTrace bool
+//
+// 返回的end必须直接以 defer end() 的形式调用：
+// 它在panic发生时负责记录并结束span，而recover只在被defer的函数中
+// 直接调用才生效，写成 defer func(){ end() }() 会使panic记录失效
+//
+// end不会吞掉panic，记录完会原样重新抛出，
+// 由gin.Recovery等上层决定如何响应
+//
+// example:
+// ctx, end := logx.Start(ctx, "queryDB")
+// defer end()
+func Start(ctx context.Context, spanName string, spanStartOption ...Field) (context.Context, func()) {
 	var span oteltrace.Span
-	// 根据配置开启日志追踪
-	if config.EnableTrace {
-		enableTrace = true
-	}
-	// 注意：不要把时间戳等可变内容拼进spanName
-	// span自带StartTime/EndTime，且spanName是后端的聚合键，
-	// 高基数会打爆Jaeger的operation列表和span metrics
-	// 根据条件
-	// 如果未开启追踪，则返回一个nooptreace，意味着将不再追踪
-	if enableTrace {
-		spanContext, span = provider.Tracer("").Start(ctx, spanName, oteltrace.WithAttributes(FieldsToKeyValues(spanStartOption...)...))
-		loggerSpanContext.span = span
+	// provider可能因构造失败而为nil，此时退化为noop
+	if config.EnableTrace && provider != nil {
+		ctx, span = provider.Tracer("").Start(ctx, spanName, oteltrace.WithAttributes(FieldsToKeyValues(spanStartOption...)...))
 	} else {
-		// 如果trace失能，将会创建一个noop traceProvider
-		spanContext, span = noop.NewTracerProvider().Tracer("").Start(ctx, spanName)
-		loggerSpanContext.span = span
+		// 追踪失能时使用noop tracer
+		// 它会保留上游传来的spanContext，因此traceID仍可透传
+		ctx, span = noopProvider.Tracer("").Start(ctx, spanName)
 	}
-	startCtx := context.WithValue(spanContext, loggerSpanContextKey, loggerSpanContext)
-	return startCtx
+	endCtx := ctx
+	return ctx, func() {
+		// recover必须在这里直接调用，不能再往下包一层函数
+		if err := recover(); err != nil {
+			recordPanic(endCtx, span, err)
+			// span必须在重新抛出之前结束，否则不会进入导出队列
+			span.End()
+			// 原样抛出，交回上层（如gin.Recovery）处理
+			// 吞掉panic会让客户端收到200空响应，监控上也成了一次成功请求
+			panic(err)
+		}
+		// noop span的End是空操作，无需判断EnableTrace
+		span.End()
+	}
+}
+
+// recordPanic 记录panic信息
+//
+// 出口与普通日志一致：本地日志、loki、span，
+// 本地日志通过FieldsToZapFields携带trace_id，可与span关联
+//
+// panic总是被记录，不受Level过滤
+//
+// span上按otel的exception语义记录并把状态置为Error，
+// 否则trace视图中这个span看起来是正常结束的
+func recordPanic(ctx context.Context, span oteltrace.Span, err any) {
+	msg := fmt.Sprintf("panic: %v", err)
+	// 在panic展开过程中取栈，包含panic的原始位置
+	stack := string(debug.Stack())
+	if enable_log {
+		logger.Error(msg, FieldsToZapFields(ctx, String("stack", stack))...)
+	} else {
+		// zap未初始化时（Output为none）回退到标准库
+		// 否则logger为nil会在记录panic的过程中再次panic
+		log.Printf("logx %s\n%s", msg, stack)
+	}
+	if config.LokiServer != "" {
+		// skip=5：lokiPush ← recordPanic ← end闭包 ← runtime.gopanic ← panic发生处
+		lokiPush(ctx, 5, "error", msg, String("stack", stack))
+	}
+	if span == nil || !config.EnableTrace || !span.IsRecording() {
+		return
+	}
+	span.RecordError(errors.New(msg), oteltrace.WithStackTrace(true))
+	span.SetStatus(codes.Error, fmt.Sprint(err))
 }
 
 // SetSpanAttr 为当前的span动态设置属性
 func SetSpanAttr(ctx context.Context, attributes ...Field) {
-	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
-	if !ok {
-		return
-	}
-	if config.EnableTrace {
-		loggerSpanContext.span.SetAttributes(FieldsToKeyValues(attributes...)...)
+	if span := spanFromContext(ctx); span != nil && config.EnableTrace && span.IsRecording() {
+		span.SetAttributes(FieldsToKeyValues(attributes...)...)
 	}
 }
 
@@ -250,14 +311,12 @@ func Debug(ctx context.Context, msg string, attributes ...Field) {
 		logger.Debug(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
 	if config.LokiServer != "" {
-		lokiPush(ctx, "debug", msg, attributes...)
+		lokiPush(ctx, 2, "debug", msg, attributes...)
 	}
-	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
-	if !ok {
-		return
-	}
-	if config.EnableTrace {
-		loggerSpanContext.span.AddEvent(msg, oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
+	// IsRecording为false时AddEvent是空操作，
+	// 提前判断可省掉FieldsToKeyValues的切片分配
+	if span := spanFromContext(ctx); span != nil && config.EnableTrace && span.IsRecording() {
+		span.AddEvent(msg, oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
 	}
 }
 
@@ -270,14 +329,12 @@ func Info(ctx context.Context, msg string, attributes ...Field) {
 		logger.Info(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
 	if config.LokiServer != "" {
-		lokiPush(ctx, "info", msg, attributes...)
+		lokiPush(ctx, 2, "info", msg, attributes...)
 	}
-	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
-	if !ok {
-		return
-	}
-	if config.EnableTrace {
-		loggerSpanContext.span.AddEvent(msg, oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
+	// IsRecording为false时AddEvent是空操作，
+	// 提前判断可省掉FieldsToKeyValues的切片分配
+	if span := spanFromContext(ctx); span != nil && config.EnableTrace && span.IsRecording() {
+		span.AddEvent(msg, oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
 	}
 }
 
@@ -290,14 +347,12 @@ func Warn(ctx context.Context, msg string, attributes ...Field) {
 		logger.Warn(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
 	if config.LokiServer != "" {
-		lokiPush(ctx, "warn", msg, attributes...)
+		lokiPush(ctx, 2, "warn", msg, attributes...)
 	}
-	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
-	if !ok {
-		return
-	}
-	if config.EnableTrace {
-		loggerSpanContext.span.AddEvent(msg, oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
+	// IsRecording为false时AddEvent是空操作，
+	// 提前判断可省掉FieldsToKeyValues的切片分配
+	if span := spanFromContext(ctx); span != nil && config.EnableTrace && span.IsRecording() {
+		span.AddEvent(msg, oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
 	}
 }
 
@@ -310,14 +365,10 @@ func Error(ctx context.Context, msg string, attributes ...Field) {
 		logger.Error(msg, FieldsToZapFields(ctx, attributes...)...)
 	}
 	if config.LokiServer != "" {
-		lokiPush(ctx, "error", msg, attributes...)
+		lokiPush(ctx, 2, "error", msg, attributes...)
 	}
-	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
-	if !ok {
-		return
-	}
-	if config.EnableTrace {
-		loggerSpanContext.span.RecordError(errors.New(msg), oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
+	if span := spanFromContext(ctx); span != nil && config.EnableTrace && span.IsRecording() {
+		span.RecordError(errors.New(msg), oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
 	}
 }
 
@@ -328,17 +379,17 @@ func Error(ctx context.Context, msg string, attributes ...Field) {
 // 注意：zap的Fatal内部会调用os.Exit(1)，os.Exit不会执行defer，
 // 所以必须先记录span、推送loki并强制导出，最后再输出日志退出
 func Fatal(ctx context.Context, msg string, attributes ...Field) {
-	if loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext); ok {
-		if config.EnableTrace {
+	if span := spanFromContext(ctx); span != nil && config.EnableTrace {
+		if span.IsRecording() {
 			// add error logs
-			loggerSpanContext.span.RecordError(errors.New(msg), oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
-			// span未结束不会进入导出队列，这里主动结束
-			// span.End重复调用是安全的，不影响调用方的 defer End(ctx)
-			loggerSpanContext.span.End()
+			span.RecordError(errors.New(msg), oteltrace.WithAttributes(FieldsToKeyValues(attributes...)...))
 		}
+		// span未结束不会进入导出队列，这里主动结束
+		// span.End重复调用是安全的
+		span.End()
 	}
 	if config.LokiServer != "" {
-		lokiPush(ctx, "fatal", msg, attributes...)
+		lokiPush(ctx, 2, "fatal", msg, attributes...)
 	}
 	// 进程即将退出，强制导出缓存的span，否则batcher中的数据会丢失
 	// 传入的ctx可能已被取消，这里用独立的超时ctx
@@ -358,20 +409,20 @@ func Fatal(ctx context.Context, msg string, attributes ...Field) {
 
 // TraceID return traceID
 func TraceID(ctx context.Context) string {
-	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
-	if !ok {
+	span := spanFromContext(ctx)
+	if span == nil {
 		return ""
 	}
-	return loggerSpanContext.span.SpanContext().TraceID().String()
+	return span.SpanContext().TraceID().String()
 }
 
 // TraceID return traceID
 func SpanID(ctx context.Context) string {
-	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
-	if !ok {
+	span := spanFromContext(ctx)
+	if span == nil {
 		return ""
 	}
-	return loggerSpanContext.span.SpanContext().SpanID().String()
+	return span.SpanContext().SpanID().String()
 }
 
 // NewRootContext new root context with given traceID and spanID
@@ -394,9 +445,13 @@ func NewRootContext(traceID string, spanID string) (context.Context, error) {
 		}
 	}
 	// generate root ctx by spanContextConfig
+	//
+	// 必须带上FlagsSampled：采样器是ParentBased的，
+	// 未标记采样的父span会让后续所有span被丢弃
 	sc := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
-		TraceID: tID,
-		SpanID:  sID,
+		TraceID:    tID,
+		SpanID:     sID,
+		TraceFlags: oteltrace.FlagsSampled,
 	})
 	ctx = oteltrace.ContextWithRemoteSpanContext(ctx, sc)
 	return ctx, nil
@@ -416,20 +471,6 @@ func GenTraceID() string {
 // GenSpanID gererate spanID
 func GenSpanID() string {
 	return randString(16)
-}
-
-// End end trace
-func End(ctx context.Context) {
-	if err := recover(); err != nil {
-		logger.Error("panic", zap.String("recover", fmt.Sprint(err)), zap.Stack("stack"))
-	}
-	loggerSpanContext, ok := ctx.Value(loggerSpanContextKey).(LoggerSpanContext)
-	if !ok {
-		return
-	}
-	if config.EnableTrace {
-		loggerSpanContext.span.End()
-	}
 }
 
 // Flush 立即将缓存中的span导出，不关闭provider
@@ -506,7 +547,12 @@ func randString(len int) string {
 	return string(bytes)
 }
 
-func lokiPush(ctx context.Context, level, msg string, attributes ...Field) {
+// lokiPush 推送一条日志到loki
+//
+// skip为runtime.Caller的栈深度，用于定位调用方：
+// 从Debug/Info等日志函数直接调用时为2；
+// 从recordPanic调用时栈上多了recordPanic、end闭包和runtime.gopanic三帧，为5
+func lokiPush(ctx context.Context, skip int, level, msg string, attributes ...Field) {
 	if reqClient == nil {
 		return
 	}
@@ -551,7 +597,7 @@ func lokiPush(ctx context.Context, level, msg string, attributes ...Field) {
 		}
 	}
 	// 获取调用堆栈信息
-	_, file, line, ok := runtime.Caller(2)
+	_, file, line, ok := runtime.Caller(skip)
 	if !ok {
 		fmt.Println("无法获取调用信息")
 		return

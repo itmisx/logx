@@ -26,6 +26,12 @@ var tracePropagator propagation.TextMapPropagator = propagation.NewCompositeText
 	b3prop.New(),
 )
 
+// TraceIDKey traceID在gin上下文中的key，同时也是响应头的名字
+//
+// GinMiddleware会自动写入，应用层可直接取用：
+// c.GetString(logx.TraceIDKey)
+const TraceIDKey = extract.TraceIDKey
+
 // HttpInject 将当前span的追踪信息注入http请求头
 func HttpInject(ctx context.Context, request *http.Request) error {
 	if request == nil {
@@ -94,8 +100,8 @@ func TraceHeaders(ctx context.Context) map[string]string {
 //
 // example:
 // ctx := logx.ContextFromHeaders(context.Background(), headers)
-// ctx = logx.Start(ctx, "consume")
-// defer logx.End(ctx)
+// ctx, end := logx.Start(ctx, "consume")
+// defer end()
 func ContextFromHeaders(ctx context.Context, headers map[string]string) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
@@ -110,7 +116,14 @@ func ContextFromHeaders(ctx context.Context, headers map[string]string) context.
 	return tracePropagator.Extract(ctx, propagation.HeaderCarrier(header))
 }
 
-// GinMiddleware extract spanContext
-func GinMiddleware(service string) gin.HandlerFunc {
-	return extract.GinMiddleware(service, extract.WithPropagators(tracePropagator))
+// GinMiddleware 提取上游span信息并创建server span
+//
+// 服务名由Init提供，已写入span的resource，中间件无需再传：
+// 底层的http.server_name语义是「匹配到的虚拟主机名」而非服务名，
+// 填服务名既重复又不符合语义，故这里固定留空
+//
+// 确实需要设置虚拟主机名时，直接使用
+// github.com/itmisx/logx/propagation/extract 下的 GinMiddleware(service, opts...)
+func GinMiddleware() gin.HandlerFunc {
+	return extract.GinMiddleware("", extract.WithPropagators(tracePropagator))
 }

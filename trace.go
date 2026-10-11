@@ -18,6 +18,21 @@ import (
 
 type Trace struct{}
 
+// newSampler 构造采样器
+//
+// 用ParentBased包裹：上游已有采样决策时直接沿用，
+// 只有根span才按ratio决定。否则同一条trace会在服务间被割裂——
+// 上游采样了、下游因ratio较小而丢弃，trace就断了
+//
+// ratio不在(0,1]范围内时视为未设置，按全量采样处理；
+// 要完全关闭追踪请使用Config.EnableTrace，而不是把ratio设为0
+func newSampler(ratio float64) sdktrace.Sampler {
+	if ratio <= 0 || ratio > 1 {
+		ratio = 1
+	}
+	return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))
+}
+
 // NewOLTPProvider
 func (tx Trace) NewOLTPProvider(
 	ctx context.Context,
@@ -52,9 +67,7 @@ func (tx Trace) NewOLTPProvider(
 	// For the demonstration, use sdktrace.AlwaysSample sampler to sample all traces.
 	// In a production application, use sdktrace.ProbabilitySampler with a desired probability.
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(
-			sdktrace.TraceIDRatioBased(conf.TraceSampleRatio), // 没父 span 的时候按 10 % 随机采样
-		),
+		sdktrace.WithSampler(newSampler(conf.TraceSampleRatio)),
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
@@ -69,8 +82,16 @@ func (tx Trace) NewOLTPProvider(
 
 // NewFileProvider
 func (tx Trace) NewFileProvider(conf Config, serviceName string, attributes ...Field) (*sdktrace.TracerProvider, error) {
-	f, _ := os.Create("trace.txt")
-	exp, _ := newExporter(f)
+	// 不能吞掉这两个错误：工作目录只读时os.Create会失败，
+	// 继续下去会返回一个看似健康、实则每次导出都失败的provider
+	f, err := os.Create("trace.txt")
+	if err != nil {
+		return nil, err
+	}
+	exp, err := newExporter(f)
+	if err != nil {
+		return nil, err
+	}
 	attributes = append(attributes, String("service.name", serviceName))
 	tp := sdktrace.NewTracerProvider(
 		// Always be sure to batch in production.
@@ -80,7 +101,7 @@ func (tx Trace) NewFileProvider(conf Config, serviceName string, attributes ...F
 			semconv.SchemaURL,
 			FieldsToKeyValues(attributes...)...,
 		)),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSampler(newSampler(conf.TraceSampleRatio)),
 	)
 
 	otel.SetTracerProvider(tp)

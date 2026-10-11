@@ -33,7 +33,7 @@
 - **通用 OTLP 导出** —— 可对接 Tempo、Jaeger、OpenTelemetry Collector 及各类兼容后端
 - **日志文件切分** —— 基于 [lumberjack](https://github.com/natefinch/lumberjack)，支持按大小切分与 cron 定时切分
 - **跨服务链路传递** —— 内置 HTTP 注入提取与 Gin 中间件，同时支持 B3 与 W3C Trace Context 两种格式，也可手动传递 header
-- **异常自动恢复** —— `defer logx.End(ctx)` 同时完成 span 结束与 panic 恢复
+- **异常自动上报** —— `Start` 返回的 `defer end()` 在 panic 时记录日志与 span 异常，然后原样抛出交由上层处理
 
 ## 架构
 
@@ -89,9 +89,9 @@ func main() {
 }
 
 func foo(ctx context.Context) {
-    // 启动一个 span，必须配套 defer End
-    ctx = logx.Start(ctx, "foo", logx.String("biz", "demo"))
-    defer logx.End(ctx)
+    // 启动一个 span，必须配套 defer end()
+    ctx, end := logx.Start(ctx, "foo", logx.String("biz", "demo"))
+    defer end()
 
     logx.Info(ctx, "处理开始", logx.Int("user_id", 1001))
 
@@ -145,7 +145,7 @@ func foo(ctx context.Context) {
 | --- | --- | --- | --- |
 | `EnableTrace` | `bool` | `false` | 追踪总开关。关闭时 `Start` 返回 noop span |
 | `TracerProviderType` | `string` | `oltp` | 导出方式，`oltp` 走 OTLP/HTTP、`file` 写入本地 `trace.txt` |
-| `TraceSampleRatio` | `float64` | `0` | 采样率，取值 `0.0`–`1.0`。`0` 为不采样，`1` 为全量采样 |
+| `TraceSampleRatio` | `float64` | `1` | 根 span 的采样率，取值 `0.0`–`1.0`。**不在 `(0,1]` 范围内（含未设置）时按全量采样处理**，要关闭追踪请用 `EnableTrace` |
 | `OTLPEndpoint` | `string` | `localhost:4318` | OTLP 地址，格式为 `host:port`，**不含 scheme 和 path** |
 | `OTLPEndpointURLPath` | `string` | `/v1/traces` | OTLP 的 URL path |
 | `OLTPInsecure` | `bool` | `false` | 为 `true` 时使用 HTTP，默认使用 HTTPS |
@@ -174,11 +174,11 @@ logx.GetLevel() // "debug"
 
 ```go
 func handle(ctx context.Context) {
-    // Start 创建 span 并返回携带 span 的新 context
+    // Start 返回携带 span 的新 context，以及结束该 span 的函数
     // 第三个参数起为 span 的附加属性
-    ctx = logx.Start(ctx, "handle", logx.String("key", "value"))
-    // End 结束 span 并恢复 panic，必须 defer，否则会造成 span 泄露
-    defer logx.End(ctx)
+    ctx, end := logx.Start(ctx, "handle", logx.String("key", "value"))
+    // end 结束 span，并在 panic 时记录异常，必须 defer，否则会造成 span 泄露
+    defer end()
 
     // 后续调用传入该 ctx，日志才能挂到这个 span 上
     logx.Info(ctx, "message", logx.Int("count", 3))
@@ -188,11 +188,13 @@ func handle(ctx context.Context) {
 将 `Start` 返回的 ctx 传给下一层，即可形成父子 span：
 
 ```go
-parent := logx.Start(context.Background(), "parent")
-defer logx.End(parent)
+parentCtx, endParent := logx.Start(context.Background(), "parent")
+defer endParent()
 
-child := logx.Start(parent, "child") // child 的父 span 为 parent
-defer logx.End(child)
+childCtx, endChild := logx.Start(parentCtx, "child") // child 的父 span 为 parent
+defer endChild()
+
+logx.Info(childCtx, "日志记录到最内层的 child span 上")
 ```
 
 ### 记录日志
@@ -212,12 +214,17 @@ logx.Fatal(ctx, "致命错误")                  // 记录后以退出码 1 结�
 | `Debug` / `Info` / `Warn` | zap 对应等级 | 对应 level label | `span.AddEvent` |
 | `Error` | `error` | `error` | `span.RecordError`（OTel exception 语义） |
 | `Fatal` | `fatal` | `fatal` | `span.RecordError` + 强制导出 + 退出进程 |
+| panic（由 `end()` 捕获） | `error` + 堆栈 | `error` | `span.RecordError` + 状态置为 `Error` |
+
+`logx.Error` 只在 span 上记一条 exception 事件，**不会**把整个 span 标记为失败——业务错误常常是已处理的。只有 panic 会把 span 状态置为 `Error`，在 trace 视图中标红。
+
+panic 的记录不受 `Level` 过滤，且 `end()` 记录完会**原样重新抛出**，不会吞掉 panic——因此 `gin.Recovery()` 等上层中间件仍能正常接管并返回 500。嵌套多层 `Start` 时，每一层都会记录一次并标红自己的 span。
 
 ### 动态补充 span 属性
 
 ```go
-ctx = logx.Start(ctx, "query")
-defer logx.End(ctx)
+ctx, end := logx.Start(ctx, "query")
+defer end()
 
 // 在 span 执行过程中追加属性
 logx.SetSpanAttr(ctx, logx.Int("rows", len(rows)))
@@ -231,6 +238,10 @@ logx.SpanID(ctx)  // 当前 span 的 ID
 ```
 
 本地日志与 Loki 推送会自动携带 `trace_id` 与 `span_id` 字段，无需手动添加。
+
+这两个函数以及 `SetSpanAttr`、各日志方法都会**优先取 `Start` 创建的 span，取不到时回退到 context 中的 OpenTelemetry span**。因此 `logx.GinMiddleware` 以及 `otelhttp`、`otelgrpc` 等第三方 instrumentation 创建的 span 都能直接使用，不必为了拿 traceID 额外包一层 `Start`。
+
+> `end` 只结束它自己那次 `Start` 创建的 span，不会误结束中间件或第三方库持有的 span。
 
 ## 链路传递
 
@@ -257,21 +268,41 @@ func post(ctx context.Context) error {
 
 ```go
 router := gin.New()
-// 参数为当前服务名，中间件会从请求头提取上游 span 信息
-router.Use(logx.GinMiddleware("my-service"))
+// 从请求头提取上游 span 信息并创建 server span
+    // 服务名由 Init 提供，已写入 span 的 resource，这里无需再传
+router.Use(logx.GinMiddleware())
 
 func handler(c *gin.Context) {
-    // 从 c.Request.Context() 取出上游 context，生成的 span 即为子 span
-    ctx := logx.Start(c.Request.Context(), "handler")
-    defer logx.End(ctx)
+    ctx := c.Request.Context()
 
+    // 中间件创建的 span 可直接使用，无需再调 Start
+    // 日志会带上 trace_id，并作为 event 挂到该 span 上
     logx.Info(ctx, "received")
+
+    // traceID 的三种取法，结果一致
+    logx.TraceID(ctx)             // 从 context
+    c.GetString(logx.TraceIDKey)  // 从 gin 上下文
+    // 调用方则可从响应头 trace-id 获取
+}
+```
+
+中间件会把 traceID 写入 gin 上下文与响应头 `trace-id`（常量 `logx.TraceIDKey`），追踪未开启时不写出。
+
+需要更细的分段时再调 `Start`，它会成为中间件 span 的子 span：
+
+```go
+func handler(c *gin.Context) {
+    ctx, end := logx.Start(c.Request.Context(), "queryDB")
+    defer end()
+
+    logx.Info(ctx, "查询开始")
 }
 ```
 
 > `logx.GinMiddleware` 使用与 `HttpInject` / `TraceHeaders` 完全一致的 propagator，无需额外配置。
 > 需要自定义 propagator 或 tracer provider 时，可直接使用
-> `github.com/itmisx/logx/propagation/extract` 下的 `GinMiddleware(service, extract.WithPropagators(...))`。
+> `github.com/itmisx/logx/propagation/extract` 下的 `GinMiddleware(service, extract.WithPropagators(...))`，
+> 其 `service` 参数对应 semconv 的 `http.server_name`，语义是虚拟主机名而非服务名。
 
 ### 手动传递 header
 
@@ -288,8 +319,8 @@ func produce(ctx context.Context, msg *Message) {
 // 下游：从 header 还原 context，再 Start 即为上游 span 的子 span
 func consume(msg *Message) {
     ctx := logx.ContextFromHeaders(context.Background(), msg.Headers())
-    ctx = logx.Start(ctx, "consume")
-    defer logx.End(ctx)
+    ctx, end := logx.Start(ctx, "consume")
+    defer end()
 
     logx.Info(ctx, "开始消费")
 }
@@ -304,8 +335,8 @@ func consume(msg *Message) {
 
 ```go
 func handler(w http.ResponseWriter, r *http.Request) {
-    ctx := logx.Start(logx.HttpExtract(r.Context(), r), "handler")
-    defer logx.End(ctx)
+    ctx, end := logx.Start(logx.HttpExtract(r.Context(), r), "handler")
+    defer end()
 
     logx.Info(ctx, "received")
 }
@@ -326,9 +357,11 @@ if err != nil {
 }
 
 // 基于该 ctx 创建的 span 会挂在传入的 trace 下
-ctx = logx.Start(ctx, "consume")
-defer logx.End(ctx)
+ctx, end := logx.Start(ctx, "consume")
+defer end()
 ```
+
+> `NewRootContext` 构造的 context 会被标记为**已采样**，因此不受 `TraceSampleRatio` 影响、必定上报。它表达的语义是「这条 trace 我要追」，适合消息消费、定时任务这类明确需要留痕的入口；如果这类入口量很大，应在调用方自行决定是否要开 span。
 
 ## 优雅退出
 
@@ -435,8 +468,7 @@ logx.Config{
 
 | 函数 | 说明 |
 | --- | --- |
-| `Start(ctx, spanName string, attrs ...Field) context.Context` | 创建 span，返回携带该 span 的 context |
-| `End(ctx context.Context)` | 结束 span 并恢复 panic，需 `defer` 调用 |
+| `Start(ctx, spanName string, attrs ...Field) (context.Context, func())` | 创建 span，返回携带该 span 的 context 与结束函数 |
 | `SetSpanAttr(ctx, attrs ...Field)` | 为当前 span 追加属性 |
 | `TraceID(ctx) string` / `SpanID(ctx) string` | 获取当前 trace / span 的 ID |
 | `GenTraceID() string` / `GenSpanID() string` | 生成合法的 trace / span ID |
@@ -450,7 +482,8 @@ logx.Config{
 | `HttpExtract(ctx, req *http.Request) context.Context` | 从 HTTP 请求头提取上游 span 信息 |
 | `TraceHeaders(ctx) map[string]string` | 导出当前 span 的追踪 header，未开启追踪时返回 `nil` |
 | `ContextFromHeaders(ctx, headers map[string]string) context.Context` | 从追踪 header 还原 context |
-| `GinMiddleware(service string) gin.HandlerFunc` | Gin 中间件，从请求头提取上游 span 信息 |
+| `GinMiddleware() gin.HandlerFunc` | Gin 中间件，提取上游 span 信息并写出 traceID 到 gin 上下文与响应头 |
+| `TraceIDKey` | 常量 `"trace-id"`，gin 上下文 key 与响应头名 |
 
 ### Field 类型
 
@@ -469,8 +502,12 @@ logx.Err(err)                    // 固定使用 error 作为 key
 
 ## 注意事项
 
-- **`Start` 必须配套 `defer End`**。缺少 `End` 会导致 span 既不结束也不导出，并持续占用内存。
+- **`Start` 返回的 `end` 必须以 `defer end()` 的形式直接调用**。缺少调用会导致 span 既不结束也不导出，并持续占用内存；写成 `defer func(){ end() }()` 会让 panic 记录失效，因为 `recover` 只在被 `defer` 的函数中直接调用才生效。
+- **`end()` 不吞 panic**。它记录日志与 span 异常后会原样重新抛出，所以 panic 仍会向上传播——Web 服务应保留 `gin.Recovery()` 之类的兜底中间件，否则 panic 会导致进程退出。
+- **`Init` 只应调用一次**。重复调用会关闭旧的 TracerProvider 再新建，期间缓冲区中未导出的 span 会被 flush，但并发调用不安全。
 - **采样率会影响 span event**。`TraceSampleRatio` 设为 `0.1` 时，约 90% 的 span 及其 event 不会上报，而 Loki 推送不受采样影响、始终为全量。需要完整日志检索能力时应同时配置 Loki。
+- **采样是 `ParentBased` 的**。上游已做出采样决策时直接沿用，`TraceSampleRatio` 只对根 span 生效。这样同一条 trace 不会因为各服务采样率不同而被割裂——上游采样了、下游却丢弃。反过来，上游若传来**未标记采样**的上下文（`traceparent` 的 flags 为 `00`，或 B3 头缺少 `X-B3-Sampled`），本服务会遵从该决策、不上报这条 trace。这是 OpenTelemetry 的标准行为，若上游服务未正确设置采样标志，会表现为下游「没有 trace」。
+- **`TraceSampleRatio` 的零值不是「不采样」**。未设置（或取值超出 `(0,1]`）时按全量采样处理，否则 `EnableTrace: true` 却忘了设采样率会导致一条 trace 都没有。要关闭追踪请设 `EnableTrace: false`。
 - **单个 span 的 event 数量有上限**。OpenTelemetry SDK 默认每个 span 最多 128 个 event，超出部分会被静默丢弃。长生命周期的 span 应拆分为多个子 span。
 - **没有 span 的 ctx 不会产生 event**。未经 `Start` 的 context（如进程启动阶段、未传递 ctx 的定时任务）调用日志方法时，本地日志和 Loki 正常写入，但不会产生 span event。
 - **`Fatal` 会结束进程**。它会先记录 span、推送 Loki、强制导出追踪数据，然后以退出码 `1` 退出，其后的代码不会执行。
